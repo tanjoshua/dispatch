@@ -1,0 +1,150 @@
+@import 'tailwindcss';
+@import 'tw-animate-css';
+@import 'shadcn/tailwind.css';
+@import '@fontsource-variable/inter';
+@import '@fontsource-variable/archivo';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+@import '@fontsource/ibm-plex-mono/600.css';
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * Hi-Vis Utility — the Dispatch design system. Light-only by design.
+ * Quiet worksheet surfaces; safety orange is reserved for exactly one
+ * meaning: "awaiting a human decision". Green = agent/approved outcomes,
+ * red = rejected/failed. Nothing else gets color.
+ */
+
+@theme inline {
+  --font-sans: 'Inter Variable', system-ui, sans-serif;
+  --font-heading: 'Archivo Variable', 'Inter Variable', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+
+  --color-signal: var(--signal);
+  --color-signal-foreground: var(--signal-foreground);
+  --color-signal-soft: var(--signal-soft);
+  --color-ok: var(--ok);
+  --color-ok-foreground: var(--ok-foreground);
+  --color-ok-soft: var(--ok-soft);
+
+  --color-sidebar-ring: var(--sidebar-ring);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar: var(--sidebar);
+  --color-chart-5: var(--chart-5);
+  --color-chart-4: var(--chart-4);
+  --color-chart-3: var(--chart-3);
+  --color-chart-2: var(--chart-2);
+  --color-chart-1: var(--chart-1);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-accent: var(--accent);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-popover: var(--popover);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --color-foreground: var(--foreground);
+  --color-background: var(--background);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  --background: #fafaf7; /* worksheet white */
+  --foreground: #1a1d1f; /* ink */
+  --card: #ffffff;
+  --card-foreground: #1a1d1f;
+  --popover: #ffffff;
+  --popover-foreground: #1a1d1f;
+  --primary: #1a1d1f;
+  --primary-foreground: #fafaf7;
+  --secondary: #f1f0ea;
+  --secondary-foreground: #1a1d1f;
+  --muted: #f1f0ea;
+  --muted-foreground: #6d7378;
+  --accent: #f1f0ea;
+  --accent-foreground: #1a1d1f;
+  --destructive: #b3402f;
+  --border: #e5e3dc;
+  --input: #dbd9d1;
+  --ring: #e8590c;
+  --signal: #e8590c; /* safety orange — pending decisions only */
+  --signal-foreground: #ffffff;
+  --signal-soft: #fdeee3;
+  --ok: #2f7d5a; /* agent / approved outcomes */
+  --ok-foreground: #ffffff;
+  --ok-soft: #e8f1ec;
+  --chart-1: #e8590c;
+  --chart-2: #2f7d5a;
+  --chart-3: #6d7378;
+  --chart-4: #b3402f;
+  --chart-5: #1a1d1f;
+  --radius: 0.5rem;
+  --sidebar: #ffffff;
+  --sidebar-foreground: #1a1d1f;
+  --sidebar-primary: #1a1d1f;
+  --sidebar-primary-foreground: #fafaf7;
+  --sidebar-accent: #f1f0ea;
+  --sidebar-accent-foreground: #1a1d1f;
+  --sidebar-border: #e5e3dc;
+  --sidebar-ring: #e8590c;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+    -webkit-font-smoothing: antialiased;
+  }
+  html {
+    @apply font-sans;
+    color-scheme: light;
+  }
+}
+
+/* the one animation: pending work breathing quietly */
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.6;
+  }
+}
+.pulse-soft {
+  animation: pulse-soft 2.4s ease-in-out infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .pulse-soft {
+    animation: none;
+  }
+}

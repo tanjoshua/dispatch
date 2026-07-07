@@ -1,0 +1,11 @@
+# Go
+/bin/
+*.test
+
+# Web
+web/node_modules/
+web/dist/
+
+# Local env
+.env
+*.log
