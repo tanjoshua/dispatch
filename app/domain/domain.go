@@ -32,12 +32,27 @@ type ChannelConnection struct {
 	CreatedAt time.Time       `json:"created_at"`
 }
 
+// Customer is the CRM aggregate: a person or business the org serves. Contact
+// endpoints (phone, email) live on ContactIdentity, not here — a customer is
+// reachable at many identities across channels (design/004-domain-remodel.md §3).
 type Customer struct {
 	ID        string    `json:"id"`
 	OrgID     string    `json:"org_id"`
-	Phone     string    `json:"phone"`
 	Name      string    `json:"name"`
 	CreatedAt time.Time `json:"created_at"`
+}
+
+// ContactIdentity is one channel endpoint a customer is reachable at — a phone
+// on WhatsApp/SMS, an email, a dev token. A customer has many; inbound resolves
+// (ChannelKind, Address) -> identity -> customer, so the same person across
+// channels is one customer (design/004-domain-remodel.md §3).
+type ContactIdentity struct {
+	ID          string    `json:"id"`
+	OrgID       string    `json:"org_id"`
+	CustomerID  string    `json:"customer_id"`
+	ChannelKind string    `json:"channel_kind"`
+	Address     string    `json:"address"`
+	CreatedAt   time.Time `json:"created_at"`
 }
 
 type ConversationStatus string

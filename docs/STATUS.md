@@ -100,6 +100,26 @@ end-to-end._
 
 ## Not yet done
 
+- **Domain remodel (`design/004-domain-remodel.md`, accepted, phased in §13).**
+  Pull apart the v1 1‑to‑1 chain (customer=phone → conversation → job → run).
+  agentkit/Action pipeline untouched throughout.
+  - [x] **Phase 1a — identity split.** `Customer` is now the CRM aggregate;
+        contact endpoints live on `contact_identities (org_id, channel_kind,
+        address)` (migration `0005`). Inbound resolves `(kind, address) →
+        identity → customer` (`GetOrCreateCustomerByIdentity`); the API surfaces a
+        thread's `contact` address (customer no longer carries `phone`). Verified:
+        build/vet/test, web build, migration applied + backfilled 1:1, new query
+        paths checked against real data. (Also fixed a pre‑existing corruption in
+        migration `0004` — a stray `</content>` — that had blocked it from ever
+        applying, so `messages.author` was missing on this DB.)
+  - [ ] **Phase 1b/2 — Case + persistent threads.** `Job → Case` (many per
+        customer, `UNIQUE(conversation_id)` dropped), threads go durable, unified
+        customer view.
+  - [ ] **Phase 3 — run per task** + context assembly (remove
+        `conversations.run_id`, `run_bindings`, hydrate from Postgres).
+  - [ ] **Phase 4 — Playbook substrate** (case type + `Data` schema + toolset/
+        policy config; `update_case` schema playbook‑driven; connection→playbook
+        binding). **Phase 5 (own doc) — pack SDK + second vertical.**
 - [ ] Live call through the Anthropic adapter (no API key in the dev
       environment; adapter compiles against the current SDK but is unexercised)
 - [ ] Automated tests (e2e was exercised manually via the API; no `_test.go`

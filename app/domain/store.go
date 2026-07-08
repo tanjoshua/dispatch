@@ -23,33 +23,60 @@ func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 
 // --- customers ---
 
-// GetOrCreateCustomer finds a customer by phone or creates one.
-func (s *Store) GetOrCreateCustomer(ctx context.Context, orgID, phone, name string) (*Customer, error) {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO customers (id, org_id, phone, name)
-		VALUES ($1, $2, $3, $4)
-		ON CONFLICT (org_id, phone) DO UPDATE
-		SET name = CASE WHEN customers.name = '' THEN EXCLUDED.name ELSE customers.name END`,
-		agentkit.NewID(), orgID, phone, name)
+// GetOrCreateCustomerByIdentity resolves the customer reachable at
+// (kind, address), creating the customer and its identity together the first
+// time. This is where an inbound message's channel address maps to a CRM
+// customer (design/004-domain-remodel.md §3) — replacing the old phone-keyed
+// customer. A blank existing name is filled if we now have one; an existing
+// name is never overwritten.
+func (s *Store) GetOrCreateCustomerByIdentity(ctx context.Context, orgID, kind, address, name string) (*Customer, error) {
+	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
-	var c Customer
-	err = s.pool.QueryRow(ctx, `
-		SELECT id, org_id, phone, name, created_at FROM customers
-		WHERE org_id = $1 AND phone = $2`, orgID, phone).
-		Scan(&c.ID, &c.OrgID, &c.Phone, &c.Name, &c.CreatedAt)
-	if err != nil {
+	defer tx.Rollback(ctx)
+
+	var customerID string
+	err = tx.QueryRow(ctx, `
+		SELECT customer_id FROM contact_identities
+		WHERE org_id = $1 AND channel_kind = $2 AND address = $3`,
+		orgID, kind, address).Scan(&customerID)
+	switch {
+	case errors.Is(err, pgx.ErrNoRows):
+		customerID = agentkit.NewID()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO customers (id, org_id, name) VALUES ($1, $2, $3)`,
+			customerID, orgID, name); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO contact_identities (id, org_id, customer_id, channel_kind, address)
+			VALUES ($1, $2, $3, $4, $5)`,
+			agentkit.NewID(), orgID, customerID, kind, address); err != nil {
+			return nil, err
+		}
+	case err != nil:
+		return nil, err
+	default:
+		if name != "" {
+			if _, err := tx.Exec(ctx, `
+				UPDATE customers SET name = $2 WHERE id = $1 AND name = ''`,
+				customerID, name); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return &c, nil
+	return s.GetCustomer(ctx, customerID)
 }
 
 func (s *Store) GetCustomer(ctx context.Context, id string) (*Customer, error) {
 	var c Customer
 	err := s.pool.QueryRow(ctx, `
-		SELECT id, org_id, phone, name, created_at FROM customers WHERE id = $1`, id).
-		Scan(&c.ID, &c.OrgID, &c.Phone, &c.Name, &c.CreatedAt)
+		SELECT id, org_id, name, created_at FROM customers WHERE id = $1`, id).
+		Scan(&c.ID, &c.OrgID, &c.Name, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -57,6 +84,29 @@ func (s *Store) GetCustomer(ctx context.Context, id string) (*Customer, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// ContactAddressForConversation returns the customer-side address for a
+// conversation — the customer's identity on that conversation's channel kind.
+// The outbound Sender uses it to address delivery, and the API surfaces it as
+// the thread's contact (design/004-domain-remodel.md §3). Empty if no matching
+// identity exists.
+func (s *Store) ContactAddressForConversation(ctx context.Context, conversationID string) (string, error) {
+	var addr string
+	err := s.pool.QueryRow(ctx, `
+		SELECT ci.address
+		FROM conversations conv
+		JOIN channel_connections cc ON cc.id = conv.channel_id
+		JOIN contact_identities ci
+		  ON ci.customer_id = conv.customer_id AND ci.channel_kind = cc.kind
+		WHERE conv.id = $1`, conversationID).Scan(&addr)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return addr, nil
 }
 
 // --- channel connections ---
@@ -277,14 +327,18 @@ func (s *Store) GetJobByConversation(ctx context.Context, conversationID string)
 }
 
 // UpsertJob creates the conversation's job if needed and applies the patch.
-// A newly created job inherits phone and name from the conversation's
-// customer, so channel-known contact details are never left blank waiting on
-// the agent to re-collect them.
+// A newly created job inherits the customer's name and their contact address on
+// the thread's channel (the phone), so channel-known contact details are never
+// left blank waiting on the agent to re-collect them.
 func (s *Store) UpsertJob(ctx context.Context, orgID, conversationID string, patch JobPatch) (*Job, error) {
 	_, err := s.pool.Exec(ctx, `
 		INSERT INTO jobs (id, org_id, conversation_id, phone, customer_name)
-		SELECT $1, $2, c.id, cust.phone, cust.name
-		FROM conversations c JOIN customers cust ON cust.id = c.customer_id
+		SELECT $1, $2, c.id, COALESCE(ci.address, ''), cust.name
+		FROM conversations c
+		JOIN customers cust ON cust.id = c.customer_id
+		JOIN channel_connections cc ON cc.id = c.channel_id
+		LEFT JOIN contact_identities ci
+		  ON ci.customer_id = cust.id AND ci.channel_kind = cc.kind
 		WHERE c.id = $3
 		ON CONFLICT (conversation_id) DO NOTHING`,
 		agentkit.NewID(), orgID, conversationID)

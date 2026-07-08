@@ -104,7 +104,7 @@ func (s *Sender) Send(ctx context.Context, conversationID string, msg OutboundMe
 	if err != nil {
 		return err
 	}
-	cust, err := s.store.GetCustomer(ctx, conv.CustomerID)
+	to, err := s.store.ContactAddressForConversation(ctx, conversationID)
 	if err != nil {
 		return err
 	}
@@ -115,7 +115,7 @@ func (s *Sender) Send(ctx context.Context, conversationID string, msg OutboundMe
 	return adapter.Deliver(ctx, Delivery{
 		Conn:           *conn,
 		ConversationID: conversationID,
-		To:             cust.Phone,
+		To:             to,
 		Msg:            msg,
 	})
 }
@@ -138,7 +138,7 @@ func NewRouter(store *domain.Store, ak akstore.Store, tc temporalclient.Client, 
 }
 
 func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in InboundMessage) (RouteResult, error) {
-	customer, err := r.store.GetOrCreateCustomer(ctx, conn.OrgID, in.From, in.Name)
+	customer, err := r.store.GetOrCreateCustomerByIdentity(ctx, conn.OrgID, conn.Kind, in.From, in.Name)
 	if err != nil {
 		return RouteResult{}, err
 	}

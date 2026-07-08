@@ -79,8 +79,12 @@ func isNotFound(err error) bool {
 type conversationSummary struct {
 	Conversation domain.Conversation `json:"conversation"`
 	Customer     *domain.Customer    `json:"customer"`
-	LastMessage  *domain.Message     `json:"last_message,omitempty"`
-	PendingCount int                 `json:"pending_count"`
+	// Contact is the customer's address on this thread's channel (their phone on
+	// dev/WhatsApp) — resolved from the contact identity, since it no longer
+	// lives on the customer (design/004-domain-remodel.md §3).
+	Contact      string          `json:"contact"`
+	LastMessage  *domain.Message `json:"last_message,omitempty"`
+	PendingCount int             `json:"pending_count"`
 }
 
 func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request) {
@@ -96,6 +100,7 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 		if cust, err := s.Domain.GetCustomer(ctx, c.CustomerID); err == nil {
 			sum.Customer = cust
 		}
+		sum.Contact, _ = s.Domain.ContactAddressForConversation(ctx, c.ID)
 		msgs, err := s.Domain.ListMessages(ctx, c.ID)
 		if err == nil && len(msgs) > 0 {
 			sum.LastMessage = &msgs[len(msgs)-1]
@@ -118,6 +123,7 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 type conversationDetail struct {
 	Conversation domain.Conversation `json:"conversation"`
 	Customer     *domain.Customer    `json:"customer"`
+	Contact      string              `json:"contact"` // customer's address on this thread's channel (design/004 §3)
 	Messages     []domain.Message    `json:"messages"`
 	Job          *domain.Job         `json:"job,omitempty"`
 	Run          *agentkit.Run       `json:"run,omitempty"`
@@ -139,6 +145,7 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 	if cust, err := s.Domain.GetCustomer(ctx, conv.CustomerID); err == nil {
 		detail.Customer = cust
 	}
+	detail.Contact, _ = s.Domain.ContactAddressForConversation(ctx, conv.ID)
 	detail.Messages, err = s.Domain.ListMessages(ctx, conv.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

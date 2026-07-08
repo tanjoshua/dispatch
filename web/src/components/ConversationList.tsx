@@ -50,7 +50,7 @@ export function ConversationList() {
               >
                 <div className="flex items-center justify-between gap-2">
                   <span className="truncate text-sm font-semibold">
-                    {c.customer?.name || c.customer?.phone || 'Unknown'}
+                    {c.customer?.name || c.contact || 'Unknown'}
                   </span>
                   {flagged && (
                     <Badge variant="signal" className="pulse-soft shrink-0 font-mono uppercase">
@@ -83,7 +83,7 @@ export function ConversationList() {
                         : '—'}
                   </span>
                   <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
-                    {c.customer?.phone}
+                    {c.contact}
                   </span>
                 </div>
               </Link>

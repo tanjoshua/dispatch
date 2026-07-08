@@ -52,9 +52,11 @@ export interface Action {
   executed_at?: string
 }
 
+// Customer is the CRM aggregate. Contact endpoints (phone, email) live on
+// contact identities, not here; a thread's contact address is surfaced as
+// `contact` on the conversation summary/detail (design/004-domain-remodel.md §3).
 export interface Customer {
   id: string
-  phone: string
   name: string
 }
 
@@ -105,6 +107,7 @@ export interface Run {
 export interface ConversationSummary {
   conversation: Conversation
   customer: Customer | null
+  contact: string // customer's address on this thread's channel (design/004 §3)
   last_message?: Message
   pending_count: number
 }
@@ -112,6 +115,7 @@ export interface ConversationSummary {
 export interface ConversationDetail {
   conversation: Conversation
   customer: Customer | null
+  contact: string // customer's address on this thread's channel (design/004 §3)
   messages: Message[] | null
   job?: Job
   run?: Run
