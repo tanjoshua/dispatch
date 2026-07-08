@@ -112,11 +112,20 @@ end-to-end._
         paths checked against real data. (Also fixed a pre‑existing corruption in
         migration `0004` — a stray `</content>` — that had blocked it from ever
         applying, so `messages.author` was missing on this DB.)
-  - [ ] **Phase 1b/2 — Case + persistent threads.** `Job → Case` (many per
-        customer, `UNIQUE(conversation_id)` dropped), threads go durable, unified
-        customer view.
-  - [ ] **Phase 3 — run per task** + context assembly (remove
-        `conversations.run_id`, `run_bindings`, hydrate from Postgres).
+  - [x] **Phase 2 — Case generalization.** `Job → Case` (migration `0006`): neutral
+        record with a typed core + per‑vertical `data` bag, a `type` discriminator,
+        and a `customer_id` reference (name → customer, contact → identity, no
+        longer copied). Tools `update_case`/`close_case` replace `update_job`/
+        `close_job`; the store's `data` merge is schema‑agnostic (playbook‑driven
+        schema needs no store change), input schema still hardcoded to the
+        field‑service fields. Transitional: case stays 1:1 with the conversation
+        and threads still close on completion (see Phase 3). Verified: build/vet/
+        test, web build, migration applied + field‑service fields moved into `data`
+        + `customer_id` backfilled.
+  - [ ] **Phase 3 — persistent threads + run per task (coupled).** Drop
+        `UNIQUE(conversation_id)` (many cases per thread), durable threads +
+        unified customer view, remove `conversations.run_id`, `run_bindings`
+        (run→case/conversation), context assembly from Postgres.
   - [ ] **Phase 4 — Playbook substrate** (case type + `Data` schema + toolset/
         policy config; `update_case` schema playbook‑driven; connection→playbook
         binding). **Phase 5 (own doc) — pack SDK + second vertical.**

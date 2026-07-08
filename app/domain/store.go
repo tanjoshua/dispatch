@@ -2,6 +2,7 @@ package domain
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -84,6 +85,17 @@ func (s *Store) GetCustomer(ctx context.Context, id string) (*Customer, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// SetCustomerName sets the customer's name. The intake agent collects the name
+// as part of the conversation; it is an attribute of the Customer (the CRM
+// aggregate), not of the case (design/004 §5), so update_case routes it here.
+func (s *Store) SetCustomerName(ctx context.Context, customerID, name string) error {
+	if name == "" {
+		return nil
+	}
+	_, err := s.pool.Exec(ctx, `UPDATE customers SET name = $2 WHERE id = $1`, customerID, name)
+	return err
 }
 
 // ContactAddressForConversation returns the customer-side address for a
@@ -303,66 +315,61 @@ func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]Mess
 	return out, rows.Err()
 }
 
-// --- jobs ---
+// --- cases ---
 
-const jobSelect = `
-	SELECT id, org_id, conversation_id, customer_name, phone, address, issue, urgency, status, created_at, updated_at
-	FROM jobs`
+const caseSelect = `
+	SELECT id, org_id, customer_id, conversation_id, type, status, data, created_at, updated_at
+	FROM cases`
 
-func (s *Store) scanJob(row pgx.Row) (*Job, error) {
-	var j Job
-	err := row.Scan(&j.ID, &j.OrgID, &j.ConversationID, &j.CustomerName, &j.Phone,
-		&j.Address, &j.Issue, &j.Urgency, &j.Status, &j.CreatedAt, &j.UpdatedAt)
+func (s *Store) scanCase(row pgx.Row) (*Case, error) {
+	var c Case
+	err := row.Scan(&c.ID, &c.OrgID, &c.CustomerID, &c.ConversationID,
+		&c.Type, &c.Status, &c.Data, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
-	return &j, nil
+	return &c, nil
 }
 
-func (s *Store) GetJobByConversation(ctx context.Context, conversationID string) (*Job, error) {
-	return s.scanJob(s.pool.QueryRow(ctx, jobSelect+` WHERE conversation_id = $1`, conversationID))
+func (s *Store) GetCaseByConversation(ctx context.Context, conversationID string) (*Case, error) {
+	return s.scanCase(s.pool.QueryRow(ctx, caseSelect+` WHERE conversation_id = $1`, conversationID))
 }
 
-// UpsertJob creates the conversation's job if needed and applies the patch.
-// A newly created job inherits the customer's name and their contact address on
-// the thread's channel (the phone), so channel-known contact details are never
-// left blank waiting on the agent to re-collect them.
-func (s *Store) UpsertJob(ctx context.Context, orgID, conversationID string, patch JobPatch) (*Job, error) {
+// UpsertCase creates the conversation's case if needed and shallow-merges the
+// patch into its Data bag (top-level keys). The patch is the playbook's
+// case-schema fields as raw JSON (field service: {address, issue, urgency}); the
+// store stays schema-agnostic so a playbook-driven schema needs no store change
+// (design/004 §5, §8). The case references the conversation's customer; the type
+// is the field-service pack's until playbook selection lands (Phase 4).
+func (s *Store) UpsertCase(ctx context.Context, orgID, conversationID string, patch json.RawMessage) (*Case, error) {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO jobs (id, org_id, conversation_id, phone, customer_name)
-		SELECT $1, $2, c.id, COALESCE(ci.address, ''), cust.name
+		INSERT INTO cases (id, org_id, conversation_id, customer_id, type)
+		SELECT $1, $2, c.id, c.customer_id, 'field_service_job'
 		FROM conversations c
-		JOIN customers cust ON cust.id = c.customer_id
-		JOIN channel_connections cc ON cc.id = c.channel_id
-		LEFT JOIN contact_identities ci
-		  ON ci.customer_id = cust.id AND ci.channel_kind = cc.kind
 		WHERE c.id = $3
 		ON CONFLICT (conversation_id) DO NOTHING`,
 		agentkit.NewID(), orgID, conversationID)
 	if err != nil {
 		return nil, err
 	}
-	_, err = s.pool.Exec(ctx, `
-		UPDATE jobs SET
-			customer_name = COALESCE($2, customer_name),
-			address       = COALESCE($3, address),
-			issue         = COALESCE($4, issue),
-			urgency       = COALESCE($5, urgency),
-			updated_at    = now()
-		WHERE conversation_id = $1`,
-		conversationID, patch.CustomerName, patch.Address, patch.Issue, patch.Urgency)
-	if err != nil {
-		return nil, err
+	if len(patch) > 0 {
+		if _, err := s.pool.Exec(ctx, `
+			UPDATE cases SET data = data || $2::jsonb, updated_at = now()
+			WHERE conversation_id = $1`,
+			conversationID, patch); err != nil {
+			return nil, err
+		}
 	}
-	return s.GetJobByConversation(ctx, conversationID)
+	return s.GetCaseByConversation(ctx, conversationID)
 }
 
-// CompleteIntake atomically marks the conversation's job intake_complete and
+// CompleteIntake atomically marks the conversation's case intake_complete and
 // closes the conversation, so the two never drift apart on a partial failure.
-func (s *Store) CompleteIntake(ctx context.Context, conversationID string) (*Job, error) {
+// (Transitional: threads still close on completion; Phase 3 makes them durable.)
+func (s *Store) CompleteIntake(ctx context.Context, conversationID string) (*Case, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
@@ -370,13 +377,13 @@ func (s *Store) CompleteIntake(ctx context.Context, conversationID string) (*Job
 	defer tx.Rollback(ctx)
 
 	tag, err := tx.Exec(ctx, `
-		UPDATE jobs SET status = 'intake_complete', updated_at = now()
+		UPDATE cases SET status = 'intake_complete', updated_at = now()
 		WHERE conversation_id = $1`, conversationID)
 	if err != nil {
 		return nil, err
 	}
 	if tag.RowsAffected() == 0 {
-		return nil, fmt.Errorf("domain: no job for conversation %s", conversationID)
+		return nil, fmt.Errorf("domain: no case for conversation %s", conversationID)
 	}
 	if _, err := tx.Exec(ctx, `
 		UPDATE conversations SET status = 'closed', updated_at = now() WHERE id = $1`,
@@ -386,5 +393,5 @@ func (s *Store) CompleteIntake(ctx context.Context, conversationID string) (*Job
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return s.GetJobByConversation(ctx, conversationID)
+	return s.GetCaseByConversation(ctx, conversationID)
 }

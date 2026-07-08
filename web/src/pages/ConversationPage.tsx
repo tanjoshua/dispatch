@@ -295,7 +295,12 @@ export function ConversationPage() {
       </div>
 
       <aside className="w-80 shrink-0 overflow-y-auto border-l p-3">
-        <JobPanel job={data.job} run={data.run} />
+        <JobPanel
+          record={data.case}
+          customerName={data.customer?.name}
+          contact={data.contact}
+          run={data.run}
+        />
       </aside>
     </div>
   )

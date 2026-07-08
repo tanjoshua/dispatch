@@ -1,5 +1,5 @@
 // Package domain holds the dispatch product's data model: customers,
-// conversations, messages, and jobs.
+// conversations, messages, and cases.
 package domain
 
 import (
@@ -117,35 +117,28 @@ type Message struct {
 	CreatedAt      time.Time     `json:"created_at"`
 }
 
-type JobStatus string
+type CaseStatus string
 
 const (
-	JobIntake         JobStatus = "intake"
-	JobIntakeComplete JobStatus = "intake_complete"
+	CaseIntake         CaseStatus = "intake"
+	CaseIntakeComplete CaseStatus = "intake_complete"
 )
 
-// Job is the structured record the intake agent builds up over the
-// conversation. One job per conversation in v1.
-type Job struct {
-	ID             string    `json:"id"`
-	OrgID          string    `json:"org_id"`
-	ConversationID string    `json:"conversation_id"`
-	CustomerName   string    `json:"customer_name"`
-	Phone          string    `json:"phone"`
-	Address        string    `json:"address"`
-	Issue          string    `json:"issue"`
-	Urgency        string    `json:"urgency"` // low | normal | high | emergency
-	Status         JobStatus `json:"status"`
-	CreatedAt      time.Time `json:"created_at"`
-	UpdatedAt      time.Time `json:"updated_at"`
-}
-
-// JobPatch is a partial update; nil fields are left unchanged. Phone is
-// deliberately absent: it's the customer's channel identity, seeded from the
-// customer record when the job is created, never collected by the agent.
-type JobPatch struct {
-	CustomerName *string `json:"customer_name,omitempty"`
-	Address      *string `json:"address,omitempty"`
-	Issue        *string `json:"issue,omitempty"`
-	Urgency      *string `json:"urgency,omitempty"`
+// Case is the unit of work the org fulfills for a customer — the generalization
+// of a field-service "job" (design/004-domain-remodel.md §5). It has a typed
+// core (customer, type, status, timestamps) plus a per-vertical Data bag whose
+// schema the playbook owns; for the field-service pack, Data holds
+// {address, issue, urgency}. Transitionally one per conversation; many-per-
+// customer / many-per-thread arrives in Phase 3. The customer's name lives on
+// the Customer and their contact on the ContactIdentity — neither is copied here.
+type Case struct {
+	ID             string          `json:"id"`
+	OrgID          string          `json:"org_id"`
+	CustomerID     string          `json:"customer_id"`
+	ConversationID string          `json:"conversation_id"`
+	Type           string          `json:"type"` // "field_service_job" — the playbook's case type
+	Status         CaseStatus      `json:"status"`
+	Data           json.RawMessage `json:"data"` // per-vertical fields; schema owned by the playbook
+	CreatedAt      time.Time       `json:"created_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
 }

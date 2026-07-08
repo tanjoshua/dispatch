@@ -43,7 +43,7 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 	}
 
 	// After this assistant turn's tools all resolved, yield (no more calls)
-	// unless we're on the closing step, which ends the run via close_job.
+	// unless we're on the closing step, which ends the run via close_case.
 	lastRole := llm.RoleUser
 	if len(req.Messages) > 0 {
 		lastRole = req.Messages[len(req.Messages)-1].Role
@@ -73,19 +73,19 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 		content = []llm.ContentBlock{reply("Sorry about that — let me rephrase. Could you tell me a bit more?")}
 	case userTurns <= 1:
 		content = []llm.ContentBlock{
-			call(1, "update_job", map[string]string{"issue": lastText}),
+			call(1, "update_case", map[string]string{"issue": lastText}),
 			reply("Thanks for reaching out! I've noted the issue. Could I get your name and the service address?"),
 		}
 	case userTurns == 2:
 		content = []llm.ContentBlock{
-			call(1, "update_job", map[string]string{"customer_name": "Customer", "address": lastText}),
+			call(1, "update_case", map[string]string{"customer_name": "Customer", "address": lastText}),
 			reply("Got it. How urgent is this — is it something that needs attention today?"),
 		}
 	default:
 		content = []llm.ContentBlock{
-			call(1, "update_job", map[string]string{"urgency": "normal"}),
+			call(1, "update_case", map[string]string{"urgency": "normal"}),
 			reply("Perfect, you're all set — the dispatcher will be in touch shortly to schedule."),
-			call(2, "close_job", map[string]string{"summary": "Intake complete: " + lastText}),
+			call(2, "close_case", map[string]string{"summary": "Intake complete: " + lastText}),
 		}
 	}
 	return &llm.CompletionResponse{Content: content, StopReason: llm.StopToolUse}, nil

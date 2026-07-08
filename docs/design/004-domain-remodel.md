@@ -373,23 +373,28 @@ keeps working with no manual steps.
 
 The four decompositions are interdependent but land in a safe order:
 
-- **Phase 1a — Identity split (CRM spine).** `Customer`/`ContactIdentity` split;
-  inbound resolves `(kind, address) → identity → customer`; the API surfaces a
-  thread's contact address so the UI keeps working. Lowest risk, fully decoupled,
-  and the precondition for a customer spanning channels. *(In progress.)*
-- **Phase 1b — Persistent threads + unified customer view.** Conversations become
-  durable per (customer, channel); the inbox groups by customer. **Coupled to
-  Phase 2:** a persistent thread only makes sense once a completed case doesn't
-  strand the thread on a finished, 1:1 job — so this lands *with* `Case`, not
-  before it. (Discovered during 1a: making threads persistent while `Job` is
-  still `UNIQUE(conversation_id)` reuses a finished job on the next message.)
-- **Phase 2 — Case (+ persistent threads, 1b).** `Job → Case`, many per customer,
-  `Data` bag, `UNIQUE(conversation_id)` dropped; `update_case` schema still
-  hardcoded to the field‑service fields (not yet playbook‑driven). Threads go
-  persistent here (1b), now that a thread can carry many cases.
-- **Phase 3 — Run per task + context assembly.** Remove `conversations.run_id`;
-  `run_bindings`; hydrate context from Postgres; router routes to a run awaiting
-  input or starts one.
+- **Phase 1a — Identity split (CRM spine).** ✅ *Done.* `Customer`/`ContactIdentity`
+  split; inbound resolves `(kind, address) → identity → customer`; the API
+  surfaces a thread's contact address so the UI keeps working. Lowest risk, fully
+  decoupled, and the precondition for a customer spanning channels.
+- **Phase 2 — Case generalization.** ✅ *Done.* `Job → Case`: neutral record with a
+  typed core + a per‑vertical `Data` bag, a `type` discriminator, and a
+  `customer_id` reference (name → customer, contact → identity, no longer copied).
+  `update_case`/`close_case` replace `update_job`/`close_job`; the `data` merge is
+  schema‑agnostic in the store (so a playbook‑driven schema needs no store
+  change), while `update_case`'s *input schema* stays hardcoded to the
+  field‑service fields until Phase 4. **Transitional:** the case stays 1:1 with the
+  conversation (`UNIQUE(conversation_id)` kept) and threads still close on
+  completion — because *which case a message belongs to* is only well‑defined once
+  runs bind to cases, which is Phase 3.
+- **Phase 3 — Persistent threads + run per task (coupled).** Drop
+  `UNIQUE(conversation_id)` (many cases per thread); make conversations durable
+  (stop closing on completion; inbox groups by customer); remove
+  `conversations.run_id`; add `run_bindings` binding a run to `(conversation,
+  case, task)`; hydrate context from Postgres. These land together because
+  multi‑case per thread needs the run→case binding to know which case is active —
+  the coupling found in Phase 2. This is also where the unified customer view
+  ships (a durable thread is what there is to group).
 - **Phase 4 — Playbook substrate.** Playbook table + selection binding;
   `update_case` schema derived from the playbook; tool catalog. Still one pack.
 - **Phase 5 (own doc, 005) — Pack SDK + second vertical.** Only when a second

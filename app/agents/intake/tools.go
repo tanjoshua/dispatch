@@ -65,19 +65,25 @@ func (t *sendMessageTool) Execute(ctx context.Context, input json.RawMessage) (j
 	return json.RawMessage(`{"status":"sent"}`), nil
 }
 
-// --- update_job ---
+// --- update_case ---
 
-type updateJobTool struct {
+// updateCaseTool records what the agent learns into the structured case record.
+// customer_name is an attribute of the customer (the CRM aggregate), so it is
+// routed there; the remaining fields are the field-service pack's case-schema
+// fields and are merged into the case's Data bag. The input schema is hardcoded
+// to the field-service fields for now; it becomes playbook-derived in Phase 4
+// (design/004 §5, §8).
+type updateCaseTool struct {
 	store *domain.Store
 }
 
-func (t *updateJobTool) Name() string { return "update_job" }
+func (t *updateCaseTool) Name() string { return "update_case" }
 
-func (t *updateJobTool) Description() string {
+func (t *updateCaseTool) Description() string {
 	return "Create or update the structured job record for this conversation. Pass only the fields you have new information for; existing values are kept. The customer's phone number is already known from the channel — don't ask for it."
 }
 
-func (t *updateJobTool) InputSchema() json.RawMessage {
+func (t *updateCaseTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
@@ -90,20 +96,36 @@ func (t *updateJobTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *updateJobTool) Execute(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
-	var patch domain.JobPatch
-	if err := json.Unmarshal(input, &patch); err != nil {
-		return nil, fmt.Errorf("update_job: invalid input: %w", err)
+func (t *updateCaseTool) Execute(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(input, &fields); err != nil {
+		return nil, fmt.Errorf("update_case: invalid input: %w", err)
 	}
 	conv, err := conversationFor(ctx, t.store)
 	if err != nil {
 		return nil, err
 	}
-	job, err := t.store.UpsertJob(ctx, conv.OrgID, conv.ID, patch)
-	if err != nil {
-		return nil, fmt.Errorf("update_job: %w", err)
+	// customer_name belongs on the customer, not the case — pull it out and
+	// route it there; the rest is the case's per-vertical data.
+	if raw, ok := fields["customer_name"]; ok {
+		var name string
+		if err := json.Unmarshal(raw, &name); err != nil {
+			return nil, fmt.Errorf("update_case: invalid customer_name: %w", err)
+		}
+		if err := t.store.SetCustomerName(ctx, conv.CustomerID, name); err != nil {
+			return nil, fmt.Errorf("update_case: %w", err)
+		}
+		delete(fields, "customer_name")
 	}
-	return json.Marshal(job)
+	patch, err := json.Marshal(fields)
+	if err != nil {
+		return nil, fmt.Errorf("update_case: %w", err)
+	}
+	c, err := t.store.UpsertCase(ctx, conv.OrgID, conv.ID, patch)
+	if err != nil {
+		return nil, fmt.Errorf("update_case: %w", err)
+	}
+	return json.Marshal(c)
 }
 
 // --- escalate ---
@@ -156,23 +178,23 @@ func (t *escalateTool) Execute(ctx context.Context, input json.RawMessage) (json
 	return json.RawMessage(`{"status":"escalated"}`), nil
 }
 
-// --- close_job ---
+// --- close_case ---
 
-type closeJobTool struct {
+type closeCaseTool struct {
 	store *domain.Store
 }
 
-type closeJobInput struct {
+type closeCaseInput struct {
 	Summary string `json:"summary"`
 }
 
-func (t *closeJobTool) Name() string { return "close_job" }
+func (t *closeCaseTool) Name() string { return "close_case" }
 
-func (t *closeJobTool) Description() string {
+func (t *closeCaseTool) Description() string {
 	return "Mark intake complete and end the conversation. Only call this after the job record has the customer's name, address, issue, and urgency, and you have sent the customer a recap."
 }
 
-func (t *closeJobTool) InputSchema() json.RawMessage {
+func (t *closeCaseTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
@@ -182,18 +204,18 @@ func (t *closeJobTool) InputSchema() json.RawMessage {
 	}`)
 }
 
-func (t *closeJobTool) Execute(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
-	var in closeJobInput
+func (t *closeCaseTool) Execute(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
+	var in closeCaseInput
 	if err := json.Unmarshal(input, &in); err != nil {
-		return nil, fmt.Errorf("close_job: invalid input: %w", err)
+		return nil, fmt.Errorf("close_case: invalid input: %w", err)
 	}
 	conv, err := conversationFor(ctx, t.store)
 	if err != nil {
 		return nil, err
 	}
-	job, err := t.store.CompleteIntake(ctx, conv.ID)
+	c, err := t.store.CompleteIntake(ctx, conv.ID)
 	if err != nil {
-		return nil, fmt.Errorf("close_job: %w", err)
+		return nil, fmt.Errorf("close_case: %w", err)
 	}
-	return json.Marshal(map[string]any{"status": "intake_complete", "job": job, "summary": in.Summary})
+	return json.Marshal(map[string]any{"status": "intake_complete", "case": c, "summary": in.Summary})
 }

@@ -125,7 +125,7 @@ type conversationDetail struct {
 	Customer     *domain.Customer    `json:"customer"`
 	Contact      string              `json:"contact"` // customer's address on this thread's channel (design/004 §3)
 	Messages     []domain.Message    `json:"messages"`
-	Job          *domain.Job         `json:"job,omitempty"`
+	Case         *domain.Case        `json:"case,omitempty"`
 	Run          *agentkit.Run       `json:"run,omitempty"`
 	Actions      []agentkit.Action   `json:"actions"`
 }
@@ -151,8 +151,8 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if job, err := s.Domain.GetJobByConversation(ctx, conv.ID); err == nil {
-		detail.Job = job
+	if c, err := s.Domain.GetCaseByConversation(ctx, conv.ID); err == nil {
+		detail.Case = c
 	}
 	if conv.RunID != "" {
 		if run, err := s.Agentkit.GetRun(ctx, conv.RunID); err == nil {

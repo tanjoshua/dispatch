@@ -35,7 +35,7 @@ type AgentDefinition struct {
 	Tools     agentkit.ToolSet
 	Policy    agentkit.Policy
 	// TerminalTools names tools whose successful execution completes the
-	// run (e.g. an intake agent's close_job).
+	// run (e.g. an intake agent's close_case).
 	TerminalTools []string
 }
 

@@ -86,15 +86,16 @@ export interface Message {
   created_at: string
 }
 
-export interface Job {
+// Case is the unit of work — the generalization of a field-service "job"
+// (design/004-domain-remodel.md §5). Typed core + a per-vertical `data` bag
+// whose schema the playbook owns (field service: address / issue / urgency).
+export interface Case {
   id: string
   conversation_id: string
-  customer_name: string
-  phone: string
-  address: string
-  issue: string
-  urgency: string
+  customer_id: string
+  type: string
   status: 'intake' | 'intake_complete'
+  data: Record<string, string>
   updated_at: string
 }
 
@@ -117,7 +118,7 @@ export interface ConversationDetail {
   customer: Customer | null
   contact: string // customer's address on this thread's channel (design/004 §3)
   messages: Message[] | null
-  job?: Job
+  case?: Case
   run?: Run
   actions: Action[] | null
 }
