@@ -13,24 +13,29 @@ import (
 
 	"dispatch/agentkit"
 	akstore "dispatch/agentkit/store"
+	"dispatch/app/channel"
 	"dispatch/app/domain"
 )
 
 type Server struct {
-	Domain    *domain.Store
-	Agentkit  akstore.Store
-	Temporal  temporalclient.Client
-	OrgID     string
-	TaskQueue string
-	AgentName string
+	Domain   *domain.Store
+	Agentkit akstore.Store
+	Temporal temporalclient.Client
+	Router   *channel.Router
+	// DefaultOrgID scopes the read API (conversation list) until auth lands (a
+	// 000 §8 non-goal). The inbound path no longer reads an org global — it
+	// resolves org from the channel connection (design/002).
+	DefaultOrgID string
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/simulate/inbound", s.handleSimulateInbound)
+	mux.HandleFunc("POST /api/dev/inbound", s.handleDevInbound)
+	mux.HandleFunc("POST /api/simulate/inbound", s.handleDevInbound) // deprecated alias (design/002 §9)
 	mux.HandleFunc("GET /api/conversations", s.handleListConversations)
 	mux.HandleFunc("GET /api/conversations/{id}", s.handleGetConversation)
 	mux.HandleFunc("POST /api/actions/{id}/decision", s.handleDecision)
+	mux.HandleFunc("POST /api/conversations/{id}/acknowledge", s.handleAcknowledge)
 	mux.HandleFunc("GET /api/runs/{id}/events", s.handleRunEvents)
 	return cors(mux)
 }
@@ -75,7 +80,7 @@ type conversationSummary struct {
 
 func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	convs, err := s.Domain.ListConversations(ctx, s.OrgID)
+	convs, err := s.Domain.ListConversations(ctx, s.DefaultOrgID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

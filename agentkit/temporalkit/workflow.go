@@ -2,6 +2,7 @@ package temporalkit
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"go.temporal.io/sdk/log"
@@ -182,21 +183,41 @@ func decideAndExecute(actCtx workflow.Context, decisionCh workflow.ReceiveChanne
 	return &ExecuteActionResult{Action: &action}, nil
 }
 
+// rejectionFeedbackPrefix opens the tool-result content the agent sees when a
+// human rejects an action. It is a stable contract: anything that needs to
+// recognize a rejection from the agent-facing message (a scripted/fake LLM, an
+// eval) does so via IsRejectionFeedback rather than re-encoding the wording,
+// so the producer and its recognizers can never drift apart.
+const rejectionFeedbackPrefix = "The dispatcher REJECTED this action."
+
+// RejectionFeedback renders the tool-result content the agent sees for a
+// human-rejected action. Exported alongside IsRejectionFeedback so the two
+// halves of the contract — producing the message and recognizing it — share
+// one definition and can be exercised together in tests.
+func RejectionFeedback(reason string) string {
+	if reason == "" {
+		reason = "no reason given"
+	}
+	return rejectionFeedbackPrefix + " Reason: " + reason +
+		"\nRevise your approach based on this feedback; do not repeat the same proposal."
+}
+
+// IsRejectionFeedback reports whether a tool-result content string is the
+// rejection feedback produced for a human-rejected action. It is the single
+// source of truth for that recognition — the structured Action state is
+// authoritative on the server, but the fake LLM only sees the rendered
+// message, so it must be able to detect a rejection from the string alone.
+func IsRejectionFeedback(content string) bool {
+	return strings.HasPrefix(content, rejectionFeedbackPrefix)
+}
+
 // feedback renders an action's outcome as the tool result the agent sees —
 // including rejections (with reason) and human edits, so the agent revises
 // rather than repeats.
 func feedback(action *agentkit.Action, call llm.ToolCall) llm.ToolResult {
 	switch action.State {
 	case agentkit.ActionRejected:
-		reason := action.Decision.Reason
-		if reason == "" {
-			reason = "no reason given"
-		}
-		return llm.ToolResult{
-			ToolCallID: call.ID,
-			Content: "The dispatcher REJECTED this action. Reason: " + reason +
-				"\nRevise your approach based on this feedback; do not repeat the same proposal.",
-		}
+		return llm.ToolResult{ToolCallID: call.ID, Content: RejectionFeedback(action.Decision.Reason)}
 	case agentkit.ActionFailed:
 		return llm.ToolResult{ToolCallID: call.ID, Content: "Tool execution failed: " + action.Error, IsError: true}
 	case agentkit.ActionCompleted:

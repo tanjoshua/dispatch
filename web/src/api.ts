@@ -50,12 +50,17 @@ export interface Customer {
   name: string
 }
 
+export type AttentionState = 'none' | 'flagged' | 'acknowledged'
+
 export interface Conversation {
   id: string
   customer_id: string
-  channel: string
+  channel_id: string
   run_id?: string
   status: 'open' | 'closed'
+  attention_state: AttentionState
+  attention_reason?: string
+  escalated_at?: string
   created_at: string
   updated_at: string
 }
@@ -123,10 +128,20 @@ export function getConversation(id: string) {
 }
 
 export function sendInbound(input: { phone: string; name: string; text: string }) {
-  return request<{ conversation_id: string; run_id: string }>('/api/simulate/inbound', {
+  return request<{ conversation_id: string; run_id: string }>('/api/dev/inbound', {
     method: 'POST',
     body: JSON.stringify(input),
   })
+}
+
+export function acknowledgeEscalation(input: { conversationId: string; note?: string }) {
+  return request<{ status: string; conversation_id: string }>(
+    `/api/conversations/${input.conversationId}/acknowledge`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ acknowledged_by: 'dispatcher', note: input.note }),
+    },
+  )
 }
 
 export function decideAction(input: {

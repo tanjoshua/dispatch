@@ -15,7 +15,8 @@ end-to-end._
       (:7233, web UI :8233)
 - [x] `migrations/0001_init.sql` + `cmd/migrate` runner
       (filename order, tracked in `schema_migrations`)
-- [x] ULIDs everywhere; `org_id` on every table (single org `org_dev` in v1)
+- [x] ULIDs everywhere; `org_id` on every table, parented by a real
+      `organizations` row as of `design/002` (seeded `org_dev`)
 
 ### agentkit (business-agnostic layer)
 
@@ -44,11 +45,21 @@ end-to-end._
 
 - [x] Domain: customers, conversations, messages, jobs + Postgres store
 - [x] Intake agent: system prompt; `send_message` / `update_job` /
-      `close_job` tools; v1 policy = all three require approval
-      (`update_job` is the designated first auto-approve candidate)
-- [x] Channel interface + simulated WhatsApp channel (inbound via the same
-      signal path a real webhook would use)
-- [x] JSON API: `POST /api/simulate/inbound`, `GET /api/conversations`,
+      `close_job` / `escalate` tools; policy auto-approves `update_job` and
+      `escalate`, requires approval for `send_message` and `close_job`
+- [x] Escalation (`design/001-escalation.md`): `escalate` tool +
+      conversation attention projection (migration `0002`) + acknowledge
+      endpoint/event; dispatcher UI flags to top with safety-orange +
+      Acknowledge. Agent escalates from judgment (no keyword rules); keyless
+      demo LLM does not simulate it — exercised by the real agent
+- [x] Org & channel connections (`design/002-organization-and-channels.md`):
+      `organizations` + `channel_connections` tables (migration `0003`,
+      seeds `org_dev` + `chan_dev`); channel split into per-kind `Adapter`
+      + shared `Sender` (outbound) / `Router` (inbound); org resolved from
+      the connection an inbound message arrives on, not a server global. Dev
+      channel is the first connection kind, exercising the production path
+- [x] JSON API: `POST /api/dev/inbound` (was `/api/simulate/inbound`, kept as
+      a deprecated alias), `GET /api/conversations`,
       `GET /api/conversations/{id}`, `POST /api/actions/{id}/decision`,
       `GET /api/runs/{id}/events`
 - [x] Temporal worker wiring; `cmd/server` + `cmd/worker` binaries
@@ -86,5 +97,8 @@ end-to-end._
 - [ ] Everything in design doc §8 non-goals: real WhatsApp adapters
       (Meta/Twilio), auto-approval policy demo ("the slider"), scheduling /
       follow-up agents, authn/authz, multi-org, learned confidence
+- [ ] Escalation follow-ups (`design/001-escalation.md` §6 Future):
+      context-aware auto-approval of safety messages while escalated, human
+      takeover, external notification (push/SMS), agentkit attention primitive
 - [ ] Open questions in design doc §11 (run granularity, decision timeouts,
       concurrent/batched actions, learning from edits)

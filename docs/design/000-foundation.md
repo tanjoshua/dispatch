@@ -366,6 +366,33 @@ dispatch/
 | React SPA (Vite + TanStack Router/Query + Tailwind) | Server-rendered Go templates + htmx | User decision. Costs a frontend toolchain, buys the UI we'd end up with anyway; the JSON API is the contract, and the server can embed built assets for single-binary deploys. |
 | Simulated channel first | Twilio/Meta from day one | Demo needs the approval loop, not webhook plumbing; Channel interface keeps the swap contained. |
 
+### Trigger to extract & publish `agentkit`
+
+The decision above defers extraction; this is the concrete signal to revisit
+it, so it's an action and not a vibe. Extract `agentkit` into its own
+repo/published module when **either**:
+
+- **A second consumer appears** — another agent business, or a second internal
+  app on the same primitives. This is the primary trigger: the second
+  consumer's disagreement with the first is the design input that tells us
+  what the stable public surface actually is. With one consumer, any public
+  API is a guess (same reason we keep `Job` typed rather than generic — don't
+  stabilize an abstraction before the second instance forces its shape).
+- **Or** the core primitives (`Action`, `Policy`, `Tool`, the event log,
+  `temporalkit`) **stop churning** for a real stretch *and* we specifically
+  want the library public/reusable.
+
+Two distinctions to keep straight when the trigger fires:
+
+- *Separate module* (mechanical, low-cost, reversible) vs. *published
+  publicly* (outward-facing: license, indexing, API-stability expectations).
+  We'll almost certainly want the first well before the second.
+- Until the trigger fires, the boundary is held by an **import lint**
+  (`agentkit` must not import `app`) rather than a split. An optional
+  reversible halfway step is promoting `agentkit` to its own module *in this
+  repo* via `go.work` (local `replace`, no version tax), which makes a future
+  repo-split a `git filter-repo` + push rather than an untangling.
+
 ## 11. Open questions (deliberately deferred)
 
 - **Run granularity beyond intake:** is a run per-conversation, per-job, or

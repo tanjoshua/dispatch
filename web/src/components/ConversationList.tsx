@@ -1,9 +1,10 @@
 import { useQuery } from '@tanstack/react-query'
 import { Link } from '@tanstack/react-router'
-import { PlusIcon } from 'lucide-react'
+import { PlusIcon, TriangleAlertIcon } from 'lucide-react'
 import { listConversations } from '../api'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { cn } from '@/lib/utils'
 
 export function ConversationList() {
   const { data } = useQuery({
@@ -32,42 +33,63 @@ export function ConversationList() {
         </p>
       )}
       <ul>
-        {conversations.map((c) => (
-          <li key={c.conversation.id}>
-            <Link
-              to="/conversations/$conversationId"
-              params={{ conversationId: c.conversation.id }}
-              className="block border-b px-4 py-3 hover:bg-muted/60"
-              activeProps={{ className: 'bg-muted/60' }}
-            >
-              <div className="flex items-center justify-between gap-2">
-                <span className="truncate text-sm font-semibold">
-                  {c.customer?.name || c.customer?.phone || 'Unknown'}
-                </span>
-                {c.pending_count > 0 && (
-                  <Badge variant="signal" className="pulse-soft shrink-0 font-mono">
-                    {c.pending_count} to review
-                  </Badge>
+        {conversations.map((c) => {
+          const flagged = c.conversation.attention_state === 'flagged'
+          return (
+            <li key={c.conversation.id}>
+              <Link
+                to="/conversations/$conversationId"
+                params={{ conversationId: c.conversation.id }}
+                className={cn(
+                  'block border-b px-4 py-3 hover:bg-muted/60',
+                  // Safety orange, reserved for "a human decision is needed
+                  // now": a flagged conversation wears a left accent.
+                  flagged && 'border-l-2 border-l-signal bg-signal/5 hover:bg-signal/10',
                 )}
-                {c.conversation.status === 'closed' && c.pending_count === 0 && (
-                  <Badge variant="outline" className="shrink-0 font-mono text-muted-foreground">
-                    closed
-                  </Badge>
-                )}
-              </div>
-              <div className="mt-0.5 flex items-baseline justify-between gap-2">
-                <span className="truncate text-xs text-muted-foreground">
-                  {c.last_message
-                    ? `${c.last_message.direction === 'inbound' ? '' : '↩ '}${c.last_message.body}`
-                    : '—'}
-                </span>
-                <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
-                  {c.customer?.phone}
-                </span>
-              </div>
-            </Link>
-          </li>
-        ))}
+                activeProps={{ className: 'bg-muted/60' }}
+              >
+                <div className="flex items-center justify-between gap-2">
+                  <span className="truncate text-sm font-semibold">
+                    {c.customer?.name || c.customer?.phone || 'Unknown'}
+                  </span>
+                  {flagged && (
+                    <Badge variant="signal" className="pulse-soft shrink-0 font-mono uppercase">
+                      <TriangleAlertIcon data-icon="inline-start" />
+                      Escalated
+                    </Badge>
+                  )}
+                  {!flagged && c.pending_count > 0 && (
+                    <Badge variant="signal" className="pulse-soft shrink-0 font-mono">
+                      {c.pending_count} to review
+                    </Badge>
+                  )}
+                  {!flagged && c.conversation.status === 'closed' && c.pending_count === 0 && (
+                    <Badge variant="outline" className="shrink-0 font-mono text-muted-foreground">
+                      closed
+                    </Badge>
+                  )}
+                </div>
+                <div className="mt-0.5 flex items-baseline justify-between gap-2">
+                  <span
+                    className={cn(
+                      'truncate text-xs text-muted-foreground',
+                      flagged && 'font-medium text-signal',
+                    )}
+                  >
+                    {flagged
+                      ? c.conversation.attention_reason || 'Needs a dispatcher now'
+                      : c.last_message
+                        ? `${c.last_message.direction === 'inbound' ? '' : '↩ '}${c.last_message.body}`
+                        : '—'}
+                  </span>
+                  <span className="shrink-0 font-mono text-[10px] text-muted-foreground">
+                    {c.customer?.phone}
+                  </span>
+                </div>
+              </Link>
+            </li>
+          )
+        })}
       </ul>
     </div>
   )

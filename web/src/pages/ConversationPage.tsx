@@ -1,26 +1,29 @@
 import { useState, type ReactNode } from 'react'
-import { useQuery } from '@tanstack/react-query'
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
 import { useParams } from '@tanstack/react-router'
 import {
   BotIcon,
   CheckIcon,
   ChevronRightIcon,
   InfoIcon,
-  MessageSquarePlusIcon,
   PencilLineIcon,
+  ShieldCheckIcon,
+  TriangleAlertIcon,
   ZapIcon,
 } from 'lucide-react'
 import {
+  acknowledgeEscalation,
   getConversation,
   isAutoDecision,
   type Action,
+  type Conversation,
   type ConversationDetail,
   type Message,
 } from '../api'
 import { ActionTicket } from '../components/ActionTicket'
 import { AgentDraft, draftText, messageText, RejectedDraft } from '../components/AgentDraft'
+import { CustomerComposer } from '../components/CustomerComposer'
 import { JobPanel } from '../components/JobPanel'
-import { Simulator } from '../components/Simulator'
 import { TimeAgo } from '../components/TimeAgo'
 import { Badge } from '@/components/ui/badge'
 import { Bubble, BubbleContent } from '@/components/ui/bubble'
@@ -44,14 +47,6 @@ import {
   CollapsibleTrigger,
 } from '@/components/ui/collapsible'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
-import {
-  Sheet,
-  SheetContent,
-  SheetDescription,
-  SheetHeader,
-  SheetTitle,
-  SheetTrigger,
-} from '@/components/ui/sheet'
 import { Skeleton } from '@/components/ui/skeleton'
 import { cn } from '@/lib/utils'
 
@@ -59,15 +54,46 @@ type TimelineItem =
   | { kind: 'message'; at: string; message: Message }
   | { kind: 'action'; at: string; action: Action }
 
+// An agent draft that hasn't been sent yet (awaiting a decision, or mid-send)
+// has not reached the customer. When the dispatcher releases it, it lands
+// after everything the customer has said so far — so that is where it belongs
+// in the thread. Pinning it to its proposed-at time would wrongly float it
+// above newer customer messages. A sent draft becomes an outbound message with
+// a real delivery time, and a rejected draft is a settled record — both keep
+// their chronological place.
+const UNSENT_DRAFT_STATES = new Set<Action['state']>([
+  'proposed',
+  'pending_approval',
+  'approved',
+  'approved_with_edits',
+  'executing',
+])
+
+function isUnsentDraft(action: Action): boolean {
+  return (
+    action.tool === 'send_message' &&
+    draftText(action) != null &&
+    UNSENT_DRAFT_STATES.has(action.state)
+  )
+}
+
 // The thread interleaves customer/agent messages with the agent's action
 // tickets in the order they happened — the dispatcher reads one review
-// timeline, not two separate lists.
+// timeline, not two separate lists — except unsent drafts, which float to the
+// bottom where they will actually be delivered.
 function buildTimeline(messages: Message[], actions: Action[]): TimelineItem[] {
   const items: TimelineItem[] = [
     ...messages.map((m) => ({ kind: 'message' as const, at: m.created_at, message: m })),
     ...actions.map((a) => ({ kind: 'action' as const, at: a.proposed_at, action: a })),
   ]
-  return items.sort((a, b) => a.at.localeCompare(b.at))
+  const byTime = (a: TimelineItem, b: TimelineItem) => a.at.localeCompare(b.at)
+  // Settled events keep their real chronological order; unsent drafts are
+  // appended after them (each group still ordered by time), so a draft always
+  // sits below every message that precedes its eventual delivery.
+  const isDraft = (i: TimelineItem) => i.kind === 'action' && isUnsentDraft(i.action)
+  const settled = items.filter((i) => !isDraft(i)).sort(byTime)
+  const drafts = items.filter(isDraft).sort(byTime)
+  return [...settled, ...drafts]
 }
 
 // An outbound message is the record of a sent reply; the completed
@@ -122,7 +148,7 @@ function renderAction(action: Action) {
 // goes wrong, noise the rest of the time.
 function DetailsPopover({ data }: { data: ConversationDetail }) {
   const rows: Array<[string, string]> = [
-    ['Channel', data.conversation.channel],
+    ['Channel', data.conversation.channel_id],
     ['Status', data.conversation.status],
     ['Run', data.run ? `${data.run.status} · ${data.run.agent}` : '—'],
     ['Run ID', data.run?.id ?? '—'],
@@ -149,29 +175,6 @@ function DetailsPopover({ data }: { data: ConversationDetail }) {
         </dl>
       </PopoverContent>
     </Popover>
-  )
-}
-
-function SimulatorSheet({ phone, closed }: { phone?: string; closed: boolean }) {
-  return (
-    <Sheet>
-      <SheetTrigger render={<Button variant="outline" size="sm" />}>
-        <MessageSquarePlusIcon data-icon="inline-start" />
-        Simulate customer
-      </SheetTrigger>
-      <SheetContent side="right">
-        <SheetHeader>
-          <SheetTitle>Customer simulator</SheetTitle>
-          <SheetDescription>
-            Sends a message through the same inbound path a WhatsApp webhook would.
-            {closed && ' This conversation is closed, so a new message starts a fresh run.'}
-          </SheetDescription>
-        </SheetHeader>
-        <div className="px-4">
-          <Simulator phone={phone} />
-        </div>
-      </SheetContent>
-    </Sheet>
   )
 }
 
@@ -218,10 +221,11 @@ export function ConversationPage() {
             </Badge>
           )}
           <div className="ml-auto flex items-center gap-1.5">
-            <SimulatorSheet phone={data.customer?.phone} closed={closed} />
             <DetailsPopover data={data} />
           </div>
         </div>
+
+        <EscalationBanner conv={data.conversation} />
 
         <div className="min-h-0 flex-1">
           <MessageScrollerProvider>
@@ -256,6 +260,11 @@ export function ConversationPage() {
                       </MessageScrollerItem>
                     )
                   })}
+                  <CustomerComposer
+                    phone={data.customer?.phone}
+                    name={data.customer?.name}
+                    closed={closed}
+                  />
                 </MessageScrollerContent>
               </MessageScrollerViewport>
               <MessageScrollerButton />
@@ -269,6 +278,62 @@ export function ConversationPage() {
       </aside>
     </div>
   )
+}
+
+// The escalation banner sits above the thread when the agent has flagged the
+// conversation for urgent human attention. Safety orange, per the design
+// system, is reserved for exactly this: a decision a human owes right now.
+// Acknowledging it is the dispatcher's "I've got this" — it records the
+// engagement and clears the alarm to a calm, settled state.
+function EscalationBanner({ conv }: { conv: Conversation }) {
+  const queryClient = useQueryClient()
+  const ack = useMutation({
+    mutationFn: () => acknowledgeEscalation({ conversationId: conv.id }),
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ['conversation', conv.id] })
+      queryClient.invalidateQueries({ queryKey: ['conversations'] })
+    },
+  })
+
+  if (conv.attention_state === 'flagged') {
+    return (
+      <div className="flex items-start gap-3 border-b border-signal/30 bg-signal/10 px-4 py-3">
+        <TriangleAlertIcon className="mt-0.5 size-5 shrink-0 text-signal" />
+        <div className="min-w-0 flex-1">
+          <p className="font-mono text-[11px] font-semibold tracking-widest text-signal uppercase">
+            Escalated — needs a dispatcher now
+          </p>
+          <p className="mt-0.5 text-sm text-foreground">
+            {conv.attention_reason || 'The agent flagged this conversation for urgent attention.'}
+          </p>
+        </div>
+        <Button
+          variant="signal"
+          size="sm"
+          className="shrink-0"
+          onClick={() => ack.mutate()}
+          disabled={ack.isPending}
+        >
+          <CheckIcon data-icon="inline-start" />
+          {ack.isPending ? 'Acknowledging…' : 'Acknowledge'}
+        </Button>
+      </div>
+    )
+  }
+
+  if (conv.attention_state === 'acknowledged') {
+    return (
+      <div className="flex items-center gap-2 border-b bg-muted/40 px-4 py-2 text-xs text-muted-foreground">
+        <ShieldCheckIcon className="size-4 shrink-0 text-ok" />
+        <span>
+          Escalation acknowledged by dispatcher
+          {conv.attention_reason ? ` — ${conv.attention_reason}` : ''}
+        </span>
+      </div>
+    )
+  }
+
+  return null
 }
 
 function MessageBubble({ message, sentBy }: { message: Message; sentBy?: Action }) {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 
 	"dispatch/agentkit/llm"
+	"dispatch/agentkit/temporalkit"
 )
 
 // ScriptedLLM is a deterministic stand-in for a real model, used for demos
@@ -35,7 +36,7 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 	rejected := false
 	if len(req.Messages) > 0 {
 		for _, b := range req.Messages[len(req.Messages)-1].Content {
-			if b.Type == "tool_result" && b.ToolResult != nil && containsRejection(b.ToolResult.Content) {
+			if b.Type == "tool_result" && b.ToolResult != nil && temporalkit.IsRejectionFeedback(b.ToolResult.Content) {
 				rejected = true
 			}
 		}
@@ -88,8 +89,4 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 		}
 	}
 	return &llm.CompletionResponse{Content: content, StopReason: llm.StopToolUse}, nil
-}
-
-func containsRejection(s string) bool {
-	return len(s) >= 25 && s[:25] == "The dispatcher REJECTED t"
 }

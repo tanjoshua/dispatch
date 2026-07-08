@@ -59,15 +59,15 @@ func (s *Store) GetCustomer(ctx context.Context, id string) (*Customer, error) {
 	return &c, nil
 }
 
-// --- conversations ---
+// --- channel connections ---
 
-const conversationSelect = `
-	SELECT id, org_id, customer_id, channel, COALESCE(run_id, ''), status, created_at, updated_at
-	FROM conversations`
+const channelConnectionSelect = `
+	SELECT id, org_id, kind, address, config, status, created_at
+	FROM channel_connections`
 
-func (s *Store) scanConversation(row pgx.Row) (*Conversation, error) {
-	var c Conversation
-	err := row.Scan(&c.ID, &c.OrgID, &c.CustomerID, &c.Channel, &c.RunID, &c.Status, &c.CreatedAt, &c.UpdatedAt)
+func (s *Store) scanChannelConnection(row pgx.Row) (*ChannelConnection, error) {
+	var c ChannelConnection
+	err := row.Scan(&c.ID, &c.OrgID, &c.Kind, &c.Address, &c.Config, &c.Status, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -77,11 +77,45 @@ func (s *Store) scanConversation(row pgx.Row) (*Conversation, error) {
 	return &c, nil
 }
 
-func (s *Store) CreateConversation(ctx context.Context, orgID, customerID, channelName string) (*Conversation, error) {
+// GetChannelConnectionByAddress resolves the connection an inbound message
+// arrived on, keyed by (kind, address). This is where org identity enters the
+// request path (design/002): the resolved connection carries OrgID downstream.
+func (s *Store) GetChannelConnectionByAddress(ctx context.Context, kind, address string) (*ChannelConnection, error) {
+	return s.scanChannelConnection(s.pool.QueryRow(ctx,
+		channelConnectionSelect+` WHERE kind = $1 AND address = $2`, kind, address))
+}
+
+// GetChannelConnection resolves a conversation's connection so the outbound
+// Sender can pick the adapter for its kind.
+func (s *Store) GetChannelConnection(ctx context.Context, id string) (*ChannelConnection, error) {
+	return s.scanChannelConnection(s.pool.QueryRow(ctx, channelConnectionSelect+` WHERE id = $1`, id))
+}
+
+// --- conversations ---
+
+const conversationSelect = `
+	SELECT id, org_id, customer_id, channel_id, COALESCE(run_id, ''), status,
+	       attention_state, attention_reason, escalated_at, created_at, updated_at
+	FROM conversations`
+
+func (s *Store) scanConversation(row pgx.Row) (*Conversation, error) {
+	var c Conversation
+	err := row.Scan(&c.ID, &c.OrgID, &c.CustomerID, &c.ChannelID, &c.RunID, &c.Status,
+		&c.AttentionState, &c.AttentionReason, &c.EscalatedAt, &c.CreatedAt, &c.UpdatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &c, nil
+}
+
+func (s *Store) CreateConversation(ctx context.Context, orgID, customerID, channelID string) (*Conversation, error) {
 	id := agentkit.NewID()
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO conversations (id, org_id, customer_id, channel) VALUES ($1, $2, $3, $4)`,
-		id, orgID, customerID, channelName)
+		INSERT INTO conversations (id, org_id, customer_id, channel_id) VALUES ($1, $2, $3, $4)`,
+		id, orgID, customerID, channelID)
 	if err != nil {
 		return nil, err
 	}
@@ -118,8 +152,46 @@ func (s *Store) CloseConversation(ctx context.Context, conversationID string) er
 	return err
 }
 
+// RaiseEscalation projects an escalate action onto the conversation: it flags
+// the conversation for urgent human attention with the agent's reason. The
+// escalate Action itself is the raised record on the append-only log; this is
+// the current-view projection the dispatcher UI reads (design/001-escalation.md).
+// Idempotent under the action pipeline's retries — the same escalation
+// re-applied is a no-op change.
+func (s *Store) RaiseEscalation(ctx context.Context, conversationID, reason string) error {
+	_, err := s.pool.Exec(ctx, `
+		UPDATE conversations
+		SET attention_state = 'flagged', attention_reason = $2,
+		    escalated_at = now(), updated_at = now()
+		WHERE id = $1`,
+		conversationID, reason)
+	return err
+}
+
+// AcknowledgeEscalation marks a flagged conversation as engaged by a
+// dispatcher. Only a flagged conversation can be acknowledged; the reason and
+// escalated_at are kept so the projection still shows what the emergency was.
+func (s *Store) AcknowledgeEscalation(ctx context.Context, conversationID string) error {
+	tag, err := s.pool.Exec(ctx, `
+		UPDATE conversations
+		SET attention_state = 'acknowledged', updated_at = now()
+		WHERE id = $1 AND attention_state = 'flagged'`,
+		conversationID)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 func (s *Store) ListConversations(ctx context.Context, orgID string) ([]Conversation, error) {
-	rows, err := s.pool.Query(ctx, conversationSelect+` WHERE org_id = $1 ORDER BY updated_at DESC`, orgID)
+	// Flagged conversations sort to the top — the dispatcher sees emergencies
+	// first — then most-recently-active within each tier.
+	rows, err := s.pool.Query(ctx, conversationSelect+`
+		WHERE org_id = $1
+		ORDER BY (attention_state = 'flagged') DESC, updated_at DESC`, orgID)
 	if err != nil {
 		return nil, err
 	}
@@ -205,9 +277,15 @@ func (s *Store) GetJobByConversation(ctx context.Context, conversationID string)
 }
 
 // UpsertJob creates the conversation's job if needed and applies the patch.
+// A newly created job inherits phone and name from the conversation's
+// customer, so channel-known contact details are never left blank waiting on
+// the agent to re-collect them.
 func (s *Store) UpsertJob(ctx context.Context, orgID, conversationID string, patch JobPatch) (*Job, error) {
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO jobs (id, org_id, conversation_id) VALUES ($1, $2, $3)
+		INSERT INTO jobs (id, org_id, conversation_id, phone, customer_name)
+		SELECT $1, $2, c.id, cust.phone, cust.name
+		FROM conversations c JOIN customers cust ON cust.id = c.customer_id
+		WHERE c.id = $3
 		ON CONFLICT (conversation_id) DO NOTHING`,
 		agentkit.NewID(), orgID, conversationID)
 	if err != nil {
@@ -216,22 +294,28 @@ func (s *Store) UpsertJob(ctx context.Context, orgID, conversationID string, pat
 	_, err = s.pool.Exec(ctx, `
 		UPDATE jobs SET
 			customer_name = COALESCE($2, customer_name),
-			phone         = COALESCE($3, phone),
-			address       = COALESCE($4, address),
-			issue         = COALESCE($5, issue),
-			urgency       = COALESCE($6, urgency),
+			address       = COALESCE($3, address),
+			issue         = COALESCE($4, issue),
+			urgency       = COALESCE($5, urgency),
 			updated_at    = now()
 		WHERE conversation_id = $1`,
-		conversationID, patch.CustomerName, patch.Phone, patch.Address, patch.Issue, patch.Urgency)
+		conversationID, patch.CustomerName, patch.Address, patch.Issue, patch.Urgency)
 	if err != nil {
 		return nil, err
 	}
 	return s.GetJobByConversation(ctx, conversationID)
 }
 
-// CompleteJob marks intake done for the conversation's job.
-func (s *Store) CompleteJob(ctx context.Context, conversationID string) (*Job, error) {
-	tag, err := s.pool.Exec(ctx, `
+// CompleteIntake atomically marks the conversation's job intake_complete and
+// closes the conversation, so the two never drift apart on a partial failure.
+func (s *Store) CompleteIntake(ctx context.Context, conversationID string) (*Job, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	tag, err := tx.Exec(ctx, `
 		UPDATE jobs SET status = 'intake_complete', updated_at = now()
 		WHERE conversation_id = $1`, conversationID)
 	if err != nil {
@@ -239,6 +323,14 @@ func (s *Store) CompleteJob(ctx context.Context, conversationID string) (*Job, e
 	}
 	if tag.RowsAffected() == 0 {
 		return nil, fmt.Errorf("domain: no job for conversation %s", conversationID)
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversations SET status = 'closed', updated_at = now() WHERE id = $1`,
+		conversationID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
 	}
 	return s.GetJobByConversation(ctx, conversationID)
 }

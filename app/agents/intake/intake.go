@@ -23,8 +23,8 @@ Your goals, in order:
 How to work:
 - Reply to the customer with the send_message tool. WhatsApp tone: short, friendly, plain language. Ask for at most one or two things per message.
 - Record information with update_job as soon as you learn it — don't wait until the end. Only pass fields you have new information for.
-- If the situation sounds dangerous (gas smell, sparking, major flooding), set urgency to emergency, tell the customer any immediate safety step, and finish intake quickly.
-- When intake is complete: send a brief recap to the customer, then call close_job.
+- If something seems unsafe, or you judge that a human should step in, call escalate right away — use your judgment; don't wait to finish intake. When you escalate for a safety reason, also send the customer the most important thing they can do to stay safe. Then keep the conversation going; a human is now involved and may take over.
+- When intake is complete: send a brief recap to the customer, then call close_job. (An escalated conversation may never reach this step — the dispatcher owns the outcome from the point you escalate.)
 
 Actions you propose may be reviewed by a human dispatcher before they execute:
 - If the dispatcher rejects an action, the rejection reason is feedback — revise your approach, don't repeat the proposal.
@@ -33,23 +33,28 @@ Actions you propose may be reviewed by a human dispatcher before they execute:
 Never invent details the customer didn't give you. Never promise arrival times or prices — the dispatcher handles scheduling and quotes.`
 
 // Definition wires the intake agent: prompt, tools, and policy. update_job
-// is auto-approved (internal, reversible record-keeping); customer-facing
-// actions (send_message) and the terminal close_job still require approval.
-func Definition(model string, store *domain.Store, ch channel.Channel) temporalkit.AgentDefinition {
+// (internal record-keeping) and escalate (raising an alarm) are auto-approved;
+// customer-facing send_message and the terminal close_job still require
+// approval.
+func Definition(model string, store *domain.Store, sender *channel.Sender) temporalkit.AgentDefinition {
 	return temporalkit.AgentDefinition{
 		Name:      AgentName,
 		Model:     model,
 		System:    systemPrompt,
 		MaxTokens: 4096,
 		Tools: agentkit.NewToolSet(
-			&sendMessageTool{store: store, channel: ch},
+			&sendMessageTool{store: store, sender: sender},
 			&updateJobTool{store: store},
 			&closeJobTool{store: store},
+			&escalateTool{store: store},
 		),
 		Policy: agentkit.StaticPolicy{ByTool: map[string]agentkit.PolicyDecision{
 			"send_message": agentkit.RequireApproval,
 			"update_job":   agentkit.AutoApprove,
 			"close_job":    agentkit.RequireApproval,
+			// Raising an alarm needs no permission — escalation is orthogonal
+			// to approval, and its only effect is to summon a human faster.
+			"escalate": agentkit.AutoApprove,
 		}},
 		TerminalTools: []string{"close_job"},
 	}

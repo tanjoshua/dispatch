@@ -13,6 +13,7 @@ import (
 	akstore "dispatch/agentkit/store"
 	"dispatch/app"
 	"dispatch/app/agents/intake"
+	"dispatch/app/channel"
 	"dispatch/app/domain"
 	"dispatch/app/server"
 )
@@ -41,13 +42,14 @@ func main() {
 	}
 	defer tc.Close()
 
+	domainStore := domain.NewStore(pool)
+	akStore := akstore.NewPostgres(pool)
 	srv := &server.Server{
-		Domain:    domain.NewStore(pool),
-		Agentkit:  akstore.NewPostgres(pool),
-		Temporal:  tc,
-		OrgID:     app.OrgID,
-		TaskQueue: app.TaskQueue,
-		AgentName: intake.AgentName,
+		Domain:       domainStore,
+		Agentkit:     akStore,
+		Temporal:     tc,
+		Router:       channel.NewRouter(domainStore, akStore, tc, app.TaskQueue, intake.AgentName),
+		DefaultOrgID: app.OrgID,
 	}
 
 	log.Printf("api server listening on :%s", port)

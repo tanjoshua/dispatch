@@ -23,8 +23,8 @@ func conversationFor(ctx context.Context, store *domain.Store) (*domain.Conversa
 // --- send_message ---
 
 type sendMessageTool struct {
-	store   *domain.Store
-	channel channel.Channel
+	store  *domain.Store
+	sender *channel.Sender
 }
 
 type sendMessageInput struct {
@@ -59,7 +59,7 @@ func (t *sendMessageTool) Execute(ctx context.Context, input json.RawMessage) (j
 	if err != nil {
 		return nil, err
 	}
-	if err := t.channel.Send(ctx, conv.ID, channel.OutboundMessage{Body: in.Message}); err != nil {
+	if err := t.sender.Send(ctx, conv.ID, channel.OutboundMessage{Body: in.Message}); err != nil {
 		return nil, fmt.Errorf("send_message: %w", err)
 	}
 	return json.RawMessage(`{"status":"sent"}`), nil
@@ -74,7 +74,7 @@ type updateJobTool struct {
 func (t *updateJobTool) Name() string { return "update_job" }
 
 func (t *updateJobTool) Description() string {
-	return "Create or update the structured job record for this conversation. Pass only the fields you have new information for; existing values are kept."
+	return "Create or update the structured job record for this conversation. Pass only the fields you have new information for; existing values are kept. The customer's phone number is already known from the channel — don't ask for it."
 }
 
 func (t *updateJobTool) InputSchema() json.RawMessage {
@@ -82,7 +82,6 @@ func (t *updateJobTool) InputSchema() json.RawMessage {
 		"type": "object",
 		"properties": {
 			"customer_name": {"type": "string", "description": "The customer's name."},
-			"phone": {"type": "string", "description": "The customer's phone number."},
 			"address": {"type": "string", "description": "The service address."},
 			"issue": {"type": "string", "description": "Clear description of the problem."},
 			"urgency": {"type": "string", "enum": ["low", "normal", "high", "emergency"], "description": "How urgent the job is."}
@@ -105,6 +104,56 @@ func (t *updateJobTool) Execute(ctx context.Context, input json.RawMessage) (jso
 		return nil, fmt.Errorf("update_job: %w", err)
 	}
 	return json.Marshal(job)
+}
+
+// --- escalate ---
+
+// escalateTool lets the agent summon a human to the run *now* — distinct from
+// proposing a customer-facing action. It is orthogonal to approval: it does
+// not decide whether an action executes (the policy still does), only how
+// urgently a dispatcher engages. See design/001-escalation.md.
+type escalateTool struct {
+	store *domain.Store
+}
+
+type escalateInput struct {
+	Reason   string `json:"reason"`
+	Category string `json:"category"`
+}
+
+func (t *escalateTool) Name() string { return "escalate" }
+
+func (t *escalateTool) Description() string {
+	return "Flag this conversation for urgent human attention now — call it whenever you judge that a situation is unsafe or that a human dispatcher should step in. This pages the dispatcher and pulls the conversation to the top of their queue. It doesn't send the customer anything, so if there's a safety step they should take, send that too. Raising it needs no approval."
+}
+
+func (t *escalateTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"reason": {"type": "string", "description": "One line for the dispatcher: what's happening and what you've told the customer."},
+			"category": {"type": "string", "enum": ["emergency", "stuck", "other"], "description": "Why you're escalating. Use emergency for danger to people or property."}
+		},
+		"required": ["reason", "category"]
+	}`)
+}
+
+func (t *escalateTool) Execute(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
+	var in escalateInput
+	if err := json.Unmarshal(input, &in); err != nil {
+		return nil, fmt.Errorf("escalate: invalid input: %w", err)
+	}
+	if in.Reason == "" {
+		return nil, fmt.Errorf("escalate: reason is empty")
+	}
+	conv, err := conversationFor(ctx, t.store)
+	if err != nil {
+		return nil, err
+	}
+	if err := t.store.RaiseEscalation(ctx, conv.ID, in.Reason); err != nil {
+		return nil, fmt.Errorf("escalate: %w", err)
+	}
+	return json.RawMessage(`{"status":"escalated"}`), nil
 }
 
 // --- close_job ---
@@ -142,11 +191,8 @@ func (t *closeJobTool) Execute(ctx context.Context, input json.RawMessage) (json
 	if err != nil {
 		return nil, err
 	}
-	job, err := t.store.CompleteJob(ctx, conv.ID)
+	job, err := t.store.CompleteIntake(ctx, conv.ID)
 	if err != nil {
-		return nil, fmt.Errorf("close_job: %w", err)
-	}
-	if err := t.store.CloseConversation(ctx, conv.ID); err != nil {
 		return nil, fmt.Errorf("close_job: %w", err)
 	}
 	return json.Marshal(map[string]any{"status": "intake_complete", "job": job, "summary": in.Summary})

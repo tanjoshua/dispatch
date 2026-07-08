@@ -12,14 +12,16 @@ import (
 	"dispatch/agentkit/temporalkit"
 	"dispatch/app"
 	"dispatch/app/agents/intake"
-	"dispatch/app/channel/simulated"
+	"dispatch/app/channel"
+	"dispatch/app/channel/dev"
 	"dispatch/app/domain"
 )
 
 // New builds the dispatch worker on the shared task queue.
 func New(tc temporalclient.Client, pool *pgxpool.Pool, model string, llmClient llm.LLM) worker.Worker {
 	appStore := domain.NewStore(pool)
-	def := intake.Definition(model, appStore, simulated.New(appStore))
+	sender := channel.NewSender(appStore, channel.NewRegistry(dev.New(appStore)))
+	def := intake.Definition(model, appStore, sender)
 
 	acts := &temporalkit.Activities{
 		LLM:   llmClient,
