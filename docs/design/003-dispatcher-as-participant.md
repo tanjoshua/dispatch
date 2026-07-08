@@ -216,5 +216,3 @@ event type, one signal, one endpoint, and the two selects above.
   (engaging *is* acknowledging — the leaning in `001` §8). Left as-is for now:
   the reply and the acknowledge are separate acts; wiring "reply implies ack"
   is a small follow-up once we see the ergonomics.
-</content>
-</invoke>

@@ -9,4 +9,3 @@
 
 ALTER TABLE messages ADD COLUMN author TEXT NOT NULL DEFAULT 'agent'; -- customer | agent | dispatcher
 UPDATE messages SET author = 'customer' WHERE direction = 'inbound';
-</content>
