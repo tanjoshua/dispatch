@@ -13,11 +13,20 @@ import (
 // conversationFor resolves the conversation a tool call belongs to via the
 // RunContext injected by the action pipeline.
 func conversationFor(ctx context.Context, store *domain.Store) (*domain.Conversation, error) {
+	_, conv, err := runAndThread(ctx, store)
+	return conv, err
+}
+
+// runAndThread resolves both the run id and its thread from the RunContext. The
+// case a run works is bound to the run (not the thread), so the case tools need
+// the run id (design/004-domain-remodel.md §6).
+func runAndThread(ctx context.Context, store *domain.Store) (string, *domain.Conversation, error) {
 	rc, ok := agentkit.RunContextFrom(ctx)
 	if !ok {
-		return nil, fmt.Errorf("intake: no run context (tool executed outside the action pipeline?)")
+		return "", nil, fmt.Errorf("intake: no run context (tool executed outside the action pipeline?)")
 	}
-	return store.GetConversationByRunID(ctx, rc.RunID)
+	conv, err := store.GetConversationByRunID(ctx, rc.RunID)
+	return rc.RunID, conv, err
 }
 
 // --- send_message ---
@@ -101,7 +110,7 @@ func (t *updateCaseTool) Execute(ctx context.Context, input json.RawMessage) (js
 	if err := json.Unmarshal(input, &fields); err != nil {
 		return nil, fmt.Errorf("update_case: invalid input: %w", err)
 	}
-	conv, err := conversationFor(ctx, t.store)
+	runID, conv, err := runAndThread(ctx, t.store)
 	if err != nil {
 		return nil, err
 	}
@@ -121,7 +130,7 @@ func (t *updateCaseTool) Execute(ctx context.Context, input json.RawMessage) (js
 	if err != nil {
 		return nil, fmt.Errorf("update_case: %w", err)
 	}
-	c, err := t.store.UpsertCase(ctx, conv.OrgID, conv.ID, patch)
+	c, err := t.store.UpsertCaseForRun(ctx, runID, conv.OrgID, conv.ID, patch)
 	if err != nil {
 		return nil, fmt.Errorf("update_case: %w", err)
 	}
@@ -209,11 +218,11 @@ func (t *closeCaseTool) Execute(ctx context.Context, input json.RawMessage) (jso
 	if err := json.Unmarshal(input, &in); err != nil {
 		return nil, fmt.Errorf("close_case: invalid input: %w", err)
 	}
-	conv, err := conversationFor(ctx, t.store)
+	runID, _, err := runAndThread(ctx, t.store)
 	if err != nil {
 		return nil, err
 	}
-	c, err := t.store.CompleteIntake(ctx, conv.ID)
+	c, err := t.store.CompleteCaseForRun(ctx, runID)
 	if err != nil {
 		return nil, fmt.Errorf("close_case: %w", err)
 	}

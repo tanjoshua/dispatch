@@ -143,7 +143,10 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 		return RouteResult{}, err
 	}
 
-	conv, err := r.store.OpenConversationForCustomer(ctx, conn.OrgID, customer.ID)
+	// The persistent thread for this (customer, channel). It is durable across
+	// runs and cases (design/004-domain-remodel.md §4) — get-or-create, never
+	// gated on status.
+	conv, err := r.store.ThreadForCustomerChannel(ctx, conn.OrgID, customer.ID, conn.ID)
 	if errors.Is(err, domain.ErrNotFound) {
 		conv, err = r.store.CreateConversation(ctx, conn.OrgID, customer.ID, conn.ID)
 	}
@@ -197,11 +200,18 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 	return RouteResult{ConversationID: conv.ID, RunID: runID, MessageID: msg.ID}, nil
 }
 
-// ensureRun returns the conversation's live run, creating a fresh one when the
-// conversation has none or its last run already finished.
+// ensureRun returns the thread's live run — the one awaiting customer input —
+// creating a fresh task-run (and its binding) when the thread has none or its
+// last run already finished. A finished run means the previous case is done; the
+// new run will open a new case on the same persistent thread
+// (design/004-domain-remodel.md §6).
 func (r *Router) ensureRun(ctx context.Context, orgID string, conv *domain.Conversation) (string, error) {
-	if conv.RunID != "" {
-		run, err := r.agentkit.GetRun(ctx, conv.RunID)
+	latest, err := r.store.LatestRunIDForConversation(ctx, conv.ID)
+	if err != nil {
+		return "", err
+	}
+	if latest != "" {
+		run, err := r.agentkit.GetRun(ctx, latest)
 		if err != nil && !errors.Is(err, akstore.ErrNotFound) {
 			return "", err
 		}
@@ -218,7 +228,7 @@ func (r *Router) ensureRun(ctx context.Context, orgID string, conv *domain.Conve
 	}); err != nil {
 		return "", err
 	}
-	if err := r.store.SetConversationRun(ctx, conv.ID, runID); err != nil {
+	if err := r.store.CreateRunBinding(ctx, runID, orgID, conv.ID, "intake"); err != nil {
 		return "", err
 	}
 	return runID, nil

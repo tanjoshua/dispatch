@@ -105,8 +105,8 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 		if err == nil && len(msgs) > 0 {
 			sum.LastMessage = &msgs[len(msgs)-1]
 		}
-		if c.RunID != "" {
-			actions, err := s.Agentkit.ListActionsByRun(ctx, c.RunID)
+		if runID, err := s.Domain.LatestRunIDForConversation(ctx, c.ID); err == nil && runID != "" {
+			actions, err := s.Agentkit.ListActionsByRun(ctx, runID)
 			if err == nil {
 				for _, a := range actions {
 					if a.State == agentkit.ActionPendingApproval {
@@ -151,14 +151,14 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if c, err := s.Domain.GetCaseByConversation(ctx, conv.ID); err == nil {
+	if c, err := s.Domain.CurrentCaseForConversation(ctx, conv.ID); err == nil {
 		detail.Case = c
 	}
-	if conv.RunID != "" {
-		if run, err := s.Agentkit.GetRun(ctx, conv.RunID); err == nil {
+	if runID, err := s.Domain.LatestRunIDForConversation(ctx, conv.ID); err == nil && runID != "" {
+		if run, err := s.Agentkit.GetRun(ctx, runID); err == nil {
 			detail.Run = run
 		}
-		if actions, err := s.Agentkit.ListActionsByRun(ctx, conv.RunID); err == nil {
+		if actions, err := s.Agentkit.ListActionsByRun(ctx, runID); err == nil {
 			detail.Actions = actions
 		}
 	}

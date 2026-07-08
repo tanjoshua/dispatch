@@ -122,10 +122,19 @@ end-to-end._
         and threads still close on completion (see Phase 3). Verified: build/vet/
         test, web build, migration applied + field‑service fields moved into `data`
         + `customer_id` backfilled.
-  - [ ] **Phase 3 — persistent threads + run per task (coupled).** Drop
-        `UNIQUE(conversation_id)` (many cases per thread), durable threads +
-        unified customer view, remove `conversations.run_id`, `run_bindings`
-        (run→case/conversation), context assembly from Postgres.
+  - [x] **Phase 3 — persistent threads + run per task.** Migration `0007`: dropped
+        `UNIQUE(conversation_id)` (many cases per thread), removed
+        `conversations.run_id`, added `run_bindings` (run → conversation + case,
+        backfilled). A run is one intake *task*; its case binds to the run on first
+        `update_case` (`UpsertCaseForRun`), so each new intake opens a new case on
+        the same durable thread. Threads no longer close on completion; the Router
+        reuses the thread's live run or starts a fresh task-run + binding.
+        Verified live (fake LLM + Temporal): inbound → run+binding+case created,
+        `data` bag populated, a running run is reused (no dup), one
+        customer/identity. **Deferred (own follow-ups):** context hydration (a new
+        run still starts without prior thread history — needs transcript assembly
+        + fake-LLM turn-count handling); a dedicated unified customer-profile UI
+        (the inbox lists threads today, each resolving to one customer).
   - [ ] **Phase 4 — Playbook substrate** (case type + `Data` schema + toolset/
         policy config; `update_case` schema playbook‑driven; connection→playbook
         binding). **Phase 5 (own doc) — pack SDK + second vertical.**

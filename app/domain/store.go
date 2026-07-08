@@ -156,13 +156,13 @@ func (s *Store) GetChannelConnection(ctx context.Context, id string) (*ChannelCo
 // --- conversations ---
 
 const conversationSelect = `
-	SELECT id, org_id, customer_id, channel_id, COALESCE(run_id, ''), status,
+	SELECT id, org_id, customer_id, channel_id, status,
 	       attention_state, attention_reason, escalated_at, created_at, updated_at
 	FROM conversations`
 
 func (s *Store) scanConversation(row pgx.Row) (*Conversation, error) {
 	var c Conversation
-	err := row.Scan(&c.ID, &c.OrgID, &c.CustomerID, &c.ChannelID, &c.RunID, &c.Status,
+	err := row.Scan(&c.ID, &c.OrgID, &c.CustomerID, &c.ChannelID, &c.Status,
 		&c.AttentionState, &c.AttentionReason, &c.EscalatedAt, &c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
@@ -188,30 +188,53 @@ func (s *Store) GetConversation(ctx context.Context, id string) (*Conversation, 
 	return s.scanConversation(s.pool.QueryRow(ctx, conversationSelect+` WHERE id = $1`, id))
 }
 
-// OpenConversationForCustomer returns the customer's open conversation, or
-// ErrNotFound.
-func (s *Store) OpenConversationForCustomer(ctx context.Context, orgID, customerID string) (*Conversation, error) {
+// ThreadForCustomerChannel returns the customer's persistent thread on a
+// channel connection, or ErrNotFound. There is one thread per (customer,
+// channel); it is durable across runs and cases, so this is not gated on status
+// (design/004-domain-remodel.md §4).
+func (s *Store) ThreadForCustomerChannel(ctx context.Context, orgID, customerID, channelID string) (*Conversation, error) {
 	return s.scanConversation(s.pool.QueryRow(ctx,
-		conversationSelect+` WHERE org_id = $1 AND customer_id = $2 AND status = 'open'
-		ORDER BY created_at DESC LIMIT 1`, orgID, customerID))
+		conversationSelect+` WHERE org_id = $1 AND customer_id = $2 AND channel_id = $3
+		ORDER BY created_at DESC LIMIT 1`, orgID, customerID, channelID))
 }
 
+// GetConversationByRunID resolves the conversation a run is bound to, via
+// run_bindings (a run no longer lives on the conversation row). Used by the
+// intake tools to find the thread from the run context.
 func (s *Store) GetConversationByRunID(ctx context.Context, runID string) (*Conversation, error) {
-	return s.scanConversation(s.pool.QueryRow(ctx, conversationSelect+` WHERE run_id = $1`, runID))
+	return s.scanConversation(s.pool.QueryRow(ctx,
+		conversationSelect+` WHERE id = (SELECT conversation_id FROM run_bindings WHERE run_id = $1)`, runID))
 }
 
-func (s *Store) SetConversationRun(ctx context.Context, conversationID, runID string) error {
+// --- run bindings ---
+
+// CreateRunBinding records that a run is a task on a conversation. The bound
+// case is set later, when the run's first update_case creates it
+// (design/004-domain-remodel.md §6).
+func (s *Store) CreateRunBinding(ctx context.Context, runID, orgID, conversationID, taskKind string) error {
 	_, err := s.pool.Exec(ctx, `
-		UPDATE conversations SET run_id = $2, updated_at = now() WHERE id = $1`,
-		conversationID, runID)
+		INSERT INTO run_bindings (run_id, org_id, conversation_id, task_kind)
+		VALUES ($1, $2, $3, $4)
+		ON CONFLICT (run_id) DO NOTHING`,
+		runID, orgID, conversationID, taskKind)
 	return err
 }
 
-func (s *Store) CloseConversation(ctx context.Context, conversationID string) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE conversations SET status = 'closed', updated_at = now() WHERE id = $1`,
-		conversationID)
-	return err
+// LatestRunIDForConversation returns the most recent run bound to a thread, or
+// "" if none. Callers check the run's status (via the agentkit store) to decide
+// whether it is live — a thread has many runs over its life, at most one active.
+func (s *Store) LatestRunIDForConversation(ctx context.Context, conversationID string) (string, error) {
+	var runID string
+	err := s.pool.QueryRow(ctx, `
+		SELECT run_id FROM run_bindings
+		WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1`, conversationID).Scan(&runID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	return runID, nil
 }
 
 // RaiseEscalation projects an escalate action onto the conversation: it flags
@@ -334,64 +357,89 @@ func (s *Store) scanCase(row pgx.Row) (*Case, error) {
 	return &c, nil
 }
 
-func (s *Store) GetCaseByConversation(ctx context.Context, conversationID string) (*Case, error) {
-	return s.scanCase(s.pool.QueryRow(ctx, caseSelect+` WHERE conversation_id = $1`, conversationID))
+func (s *Store) GetCase(ctx context.Context, id string) (*Case, error) {
+	return s.scanCase(s.pool.QueryRow(ctx, caseSelect+` WHERE id = $1`, id))
 }
 
-// UpsertCase creates the conversation's case if needed and shallow-merges the
-// patch into its Data bag (top-level keys). The patch is the playbook's
-// case-schema fields as raw JSON (field service: {address, issue, urgency}); the
-// store stays schema-agnostic so a playbook-driven schema needs no store change
-// (design/004 §5, §8). The case references the conversation's customer; the type
-// is the field-service pack's until playbook selection lands (Phase 4).
-func (s *Store) UpsertCase(ctx context.Context, orgID, conversationID string, patch json.RawMessage) (*Case, error) {
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO cases (id, org_id, conversation_id, customer_id, type)
-		SELECT $1, $2, c.id, c.customer_id, 'field_service_job'
-		FROM conversations c
-		WHERE c.id = $3
-		ON CONFLICT (conversation_id) DO NOTHING`,
-		agentkit.NewID(), orgID, conversationID)
-	if err != nil {
-		return nil, err
-	}
-	if len(patch) > 0 {
-		if _, err := s.pool.Exec(ctx, `
-			UPDATE cases SET data = data || $2::jsonb, updated_at = now()
-			WHERE conversation_id = $1`,
-			conversationID, patch); err != nil {
-			return nil, err
-		}
-	}
-	return s.GetCaseByConversation(ctx, conversationID)
+// CurrentCaseForConversation returns the thread's most recent case, or
+// ErrNotFound. A persistent thread can carry many cases; the dispatcher UI shows
+// the latest (design/004-domain-remodel.md §5).
+func (s *Store) CurrentCaseForConversation(ctx context.Context, conversationID string) (*Case, error) {
+	return s.scanCase(s.pool.QueryRow(ctx,
+		caseSelect+` WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1`, conversationID))
 }
 
-// CompleteIntake atomically marks the conversation's case intake_complete and
-// closes the conversation, so the two never drift apart on a partial failure.
-// (Transitional: threads still close on completion; Phase 3 makes them durable.)
-func (s *Store) CompleteIntake(ctx context.Context, conversationID string) (*Case, error) {
+// UpsertCaseForRun creates the case the run is working (binding it to the run on
+// first call) if needed, then shallow-merges the patch into its Data bag
+// (top-level keys). The case belongs to the run, not the thread, so each intake
+// run produces its own case — the basis for many cases per thread
+// (design/004-domain-remodel.md §6). The patch is the playbook's case-schema
+// fields as raw JSON; the store stays schema-agnostic, so a playbook-driven
+// schema needs no store change (§5, §8).
+func (s *Store) UpsertCaseForRun(ctx context.Context, runID, orgID, conversationID string, patch json.RawMessage) (*Case, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
 
-	tag, err := tx.Exec(ctx, `
-		UPDATE cases SET status = 'intake_complete', updated_at = now()
-		WHERE conversation_id = $1`, conversationID)
-	if err != nil {
+	// Find the run's bound case, locking the binding so concurrent activity
+	// retries can't create two cases for one run.
+	var caseID *string
+	if err := tx.QueryRow(ctx, `
+		SELECT case_id FROM run_bindings WHERE run_id = $1 FOR UPDATE`, runID).Scan(&caseID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("domain: no run binding for run %s", runID)
+		}
 		return nil, err
 	}
-	if tag.RowsAffected() == 0 {
-		return nil, fmt.Errorf("domain: no case for conversation %s", conversationID)
+	if caseID == nil {
+		id := agentkit.NewID()
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO cases (id, org_id, conversation_id, customer_id, type)
+			SELECT $1, $2, c.id, c.customer_id, 'field_service_job'
+			FROM conversations c WHERE c.id = $3`,
+			id, orgID, conversationID); err != nil {
+			return nil, err
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE run_bindings SET case_id = $2 WHERE run_id = $1`, runID, id); err != nil {
+			return nil, err
+		}
+		caseID = &id
 	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE conversations SET status = 'closed', updated_at = now() WHERE id = $1`,
-		conversationID); err != nil {
-		return nil, err
+	if len(patch) > 0 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE cases SET data = data || $2::jsonb, updated_at = now() WHERE id = $1`,
+			*caseID, patch); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return nil, err
 	}
-	return s.GetCaseByConversation(ctx, conversationID)
+	return s.GetCase(ctx, *caseID)
+}
+
+// CompleteCaseForRun marks the run's bound case intake_complete. It does NOT
+// close the thread — threads are persistent (design/004-domain-remodel.md §4);
+// the next customer message starts a fresh run and a fresh case on the same
+// thread.
+func (s *Store) CompleteCaseForRun(ctx context.Context, runID string) (*Case, error) {
+	var caseID *string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT case_id FROM run_bindings WHERE run_id = $1`, runID).Scan(&caseID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("domain: no run binding for run %s", runID)
+		}
+		return nil, err
+	}
+	if caseID == nil {
+		return nil, fmt.Errorf("domain: run %s has no case to complete", runID)
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE cases SET status = 'intake_complete', updated_at = now() WHERE id = $1`, *caseID); err != nil {
+		return nil, err
+	}
+	return s.GetCase(ctx, *caseID)
 }

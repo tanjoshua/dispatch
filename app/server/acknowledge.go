@@ -46,12 +46,17 @@ func (s *Server) handleAcknowledge(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// The acknowledge event lives on the run's log. escalated_at scopes the
-	// dedupe key to this escalation episode, so acknowledging a later re-flag
-	// records its own event rather than being swallowed as a duplicate.
+	// The acknowledge event lives on the thread's latest run log. escalated_at
+	// scopes the dedupe key to this escalation episode, so acknowledging a later
+	// re-flag records its own event rather than being swallowed as a duplicate.
 	dedupe := "escalation_acknowledged:" + conv.ID
 	if conv.EscalatedAt != nil {
 		dedupe += ":" + conv.EscalatedAt.UTC().Format(time.RFC3339Nano)
+	}
+	runID, err := s.Domain.LatestRunIDForConversation(ctx, conv.ID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
 	}
 	payload, _ := json.Marshal(map[string]string{
 		"conversation_id": conv.ID,
@@ -61,7 +66,7 @@ func (s *Server) handleAcknowledge(w http.ResponseWriter, r *http.Request) {
 	if err := s.Agentkit.AppendEvent(ctx, agentkit.Event{
 		ID:        agentkit.NewID(),
 		OrgID:     conv.OrgID,
-		RunID:     conv.RunID,
+		RunID:     runID,
 		Type:      domain.EventEscalationAcknowledged,
 		Payload:   payload,
 		DedupeKey: dedupe,

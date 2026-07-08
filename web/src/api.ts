@@ -66,7 +66,6 @@ export interface Conversation {
   id: string
   customer_id: string
   channel_id: string
-  run_id?: string
   status: 'open' | 'closed'
   attention_state: AttentionState
   attention_reason?: string

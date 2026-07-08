@@ -387,14 +387,17 @@ The four decompositions are interdependent but land in a safe order:
   conversation (`UNIQUE(conversation_id)` kept) and threads still close on
   completion — because *which case a message belongs to* is only well‑defined once
   runs bind to cases, which is Phase 3.
-- **Phase 3 — Persistent threads + run per task (coupled).** Drop
-  `UNIQUE(conversation_id)` (many cases per thread); make conversations durable
-  (stop closing on completion; inbox groups by customer); remove
-  `conversations.run_id`; add `run_bindings` binding a run to `(conversation,
-  case, task)`; hydrate context from Postgres. These land together because
-  multi‑case per thread needs the run→case binding to know which case is active —
-  the coupling found in Phase 2. This is also where the unified customer view
-  ships (a durable thread is what there is to group).
+- **Phase 3 — Persistent threads + run per task (coupled).** ✅ *Done (structural).*
+  Dropped `UNIQUE(conversation_id)` (many cases per thread); made conversations
+  durable (stop closing on completion); removed `conversations.run_id`; added
+  `run_bindings` binding a run to `(conversation, case, task)`. The case binds to
+  the run on first `update_case`, so multi‑case per thread has a well‑defined
+  "which case is active." **Context hydration is deferred** to a clean follow‑up
+  (a new task‑run still starts without prior thread history — the pre‑existing
+  003 §8 limitation): it needs faithful transcript assembly *and* handling for the
+  scripted fake‑LLM's user‑turn counting, which don't belong rushed into the
+  structural change. The **unified customer‑profile UI** (grouping a customer's
+  threads/cases) is also its own follow‑up; the data model now supports it.
 - **Phase 4 — Playbook substrate.** Playbook table + selection binding;
   `update_case` schema derived from the playbook; tool catalog. Still one pack.
 - **Phase 5 (own doc, 005) — Pack SDK + second vertical.** Only when a second

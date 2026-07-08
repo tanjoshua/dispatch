@@ -75,12 +75,16 @@ const (
 	AttentionAcknowledged AttentionState = "acknowledged" // a dispatcher engaged
 )
 
+// Conversation is the persistent messaging thread with a customer on a channel
+// — one per (customer, channel), durable across many agent runs and cases
+// (design/004-domain-remodel.md §4). It no longer carries "the" run; a run is a
+// task bound to the thread in run_bindings, and a thread can have many over its
+// life. Status stays for a future archive state; threads are never auto-closed.
 type Conversation struct {
 	ID              string             `json:"id"`
 	OrgID           string             `json:"org_id"`
 	CustomerID      string             `json:"customer_id"`
 	ChannelID       string             `json:"channel_id"` // the connection this conversation belongs to
-	RunID           string             `json:"run_id,omitempty"` // current agent run
 	Status          ConversationStatus `json:"status"`
 	AttentionState  AttentionState     `json:"attention_state"`
 	AttentionReason string             `json:"attention_reason,omitempty"`
