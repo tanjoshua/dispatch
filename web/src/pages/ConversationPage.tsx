@@ -21,7 +21,7 @@ import {
   type Message,
 } from '../api'
 import { ActionTicket } from '../components/ActionTicket'
-import { AgentDraft, draftText, messageText, RejectedDraft } from '../components/AgentDraft'
+import { AgentDraft, draftText, messageText, RevisedDraft } from '../components/AgentDraft'
 import { CustomerComposer } from '../components/CustomerComposer'
 import { JobPanel } from '../components/JobPanel'
 import { TimeAgo } from '../components/TimeAgo'
@@ -59,8 +59,8 @@ type TimelineItem =
 // after everything the customer has said so far — so that is where it belongs
 // in the thread. Pinning it to its proposed-at time would wrongly float it
 // above newer customer messages. A sent draft becomes an outbound message with
-// a real delivery time, and a rejected draft is a settled record — both keep
-// their chronological place.
+// a real delivery time, and a superseded (revised) draft is a settled record —
+// both keep their chronological place.
 const UNSENT_DRAFT_STATES = new Set<Action['state']>([
   'proposed',
   'pending_approval',
@@ -122,9 +122,10 @@ function matchSentActions(messages: Message[], actions: Action[]): Map<string, A
 // A proposed reply is a message, so it renders as one: a draft bubble in
 // the thread (AgentDraft). Once it's sent, the real outbound message is the
 // record — its bubble wears the release stamp (and the pre-edit original,
-// if any), so the action row would be a duplicate. Drop it. A rejected
-// reply stays in the thread as a dead draft with the reason attached
-// (RejectedDraft). Failed sends and everything else stay work-order
+// if any), so the action row would be a duplicate. Drop it. A draft the
+// dispatcher sent back stays in the thread as a superseded record with the
+// revision instruction attached (RevisedDraft) — the fresh draft the agent
+// produced sits below it. Failed sends and everything else stay work-order
 // tickets.
 function renderAction(action: Action) {
   if (action.tool === 'send_message' && draftText(action) != null) {
@@ -136,7 +137,7 @@ function renderAction(action: Action) {
       case 'executing':
         return <AgentDraft action={action} />
       case 'rejected':
-        return <RejectedDraft action={action} />
+        return <RevisedDraft action={action} />
       case 'completed':
         return null
     }

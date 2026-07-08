@@ -1,11 +1,10 @@
 import { useState } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { BotIcon, XIcon } from 'lucide-react'
+import { BotIcon, RotateCcwIcon } from 'lucide-react'
 import { decideAction, type Action } from '../api'
 import { TimeAgo } from './TimeAgo'
 import { Bubble, BubbleContent } from '@/components/ui/bubble'
 import { Button } from '@/components/ui/button'
-import { Input } from '@/components/ui/input'
 import {
   Message,
   MessageContent,
@@ -27,29 +26,37 @@ export function draftText(action: Action): string | null {
   return messageText(action.edited_input ?? action.input)
 }
 
-// A rejected reply is a dead draft, not a work order: it keeps the draft
-// bubble's shape with the strip flipped to "rejected", and the dispatcher's
-// reason quoted underneath — that reason is why the revision below exists.
-export function RejectedDraft({ action }: { action: Action }) {
+// When the dispatcher sends a draft back for a revision, the superseded draft
+// stays in the thread as a quiet, settled record — not a harsh rejection. It
+// keeps the draft bubble's shape with the strip flipped to "revised", and the
+// dispatcher's instruction quoted underneath, so you can read what you asked
+// for against the fresh draft the agent produced below.
+//
+// On the wire this is still a `reject` decision: the agent loop already treats
+// a rejection as "revise, don't repeat", so "revise" is the honest name for
+// what the mechanism does. A true veto / take-over — where the agent stands
+// down and the dispatcher writes the reply themselves — waits on the dispatcher
+// composer and is deliberately not offered yet.
+export function RevisedDraft({ action }: { action: Action }) {
   const text = draftText(action) ?? ''
   return (
     <Message align="end">
       <MessageContent>
         <Bubble variant="outline" align="end" className="max-w-full">
           <BubbleContent className="border-dashed bg-muted/40 p-0">
-            <div className="flex items-center gap-1.5 border-b border-dashed px-3 py-1 font-mono text-[10px] tracking-widest text-destructive uppercase [&_svg]:size-3 [&_svg]:shrink-0">
+            <div className="flex items-center gap-1.5 border-b border-dashed px-3 py-1 font-mono text-[10px] tracking-widest text-muted-foreground uppercase [&_svg]:size-3 [&_svg]:shrink-0">
               <BotIcon />
               <span>Agent draft</span>
               <span className="opacity-50">·</span>
-              <XIcon />
-              <span>rejected</span>
+              <RotateCcwIcon />
+              <span>revised</span>
             </div>
             <div className="px-3 py-2 text-muted-foreground whitespace-pre-wrap">{text}</div>
           </BubbleContent>
         </Bubble>
         {action.decision?.reason && (
           <p className="m-0 max-w-[80%] self-end px-3 text-right text-xs text-muted-foreground">
-            “{action.decision.reason}” — {action.decision.decided_by}
+            You asked the agent to revise: “{action.decision.reason}”
           </p>
         )}
         <MessageFooter>
@@ -65,7 +72,7 @@ export function RejectedDraft({ action }: { action: Action }) {
 // draft — with the decision keys underneath instead of a ticket card.
 export function AgentDraft({ action }: { action: Action }) {
   const qc = useQueryClient()
-  const [mode, setMode] = useState<'idle' | 'edit' | 'reject'>('idle')
+  const [mode, setMode] = useState<'idle' | 'edit' | 'revise'>('idle')
   const [draft, setDraft] = useState('')
   const [reason, setReason] = useState('')
 
@@ -150,10 +157,10 @@ export function AgentDraft({ action }: { action: Action }) {
             <div className="flex justify-end gap-2 pt-1">
               <Button
                 size="sm"
-                variant="destructive"
-                onClick={() => setMode('reject')}
+                variant="ghost"
+                onClick={() => setMode('revise')}
               >
-                Reject…
+                Revise…
               </Button>
               <Button
                 size="sm"
@@ -176,13 +183,15 @@ export function AgentDraft({ action }: { action: Action }) {
             </div>
           )}
 
-          {pending && mode === 'reject' && (
+          {pending && mode === 'revise' && (
             <div className="flex w-96 max-w-full flex-col gap-2 pt-1">
-              <Input
+              <Textarea
                 value={reason}
                 onChange={(e) => setReason(e.target.value)}
+                rows={2}
                 autoFocus
-                placeholder="Why is this wrong? The agent reads this and revises."
+                className="bg-card text-sm"
+                placeholder="Tell the agent what to change — it rewrites the draft."
               />
               <div className="flex justify-end gap-2">
                 <Button size="sm" variant="ghost" onClick={() => setMode('idle')}>
@@ -190,7 +199,6 @@ export function AgentDraft({ action }: { action: Action }) {
                 </Button>
                 <Button
                   size="sm"
-                  variant="destructive"
                   onClick={() =>
                     reason.trim() &&
                     decide.mutate({ actionId: action.id, kind: 'reject', reason })
@@ -198,7 +206,7 @@ export function AgentDraft({ action }: { action: Action }) {
                   disabled={decide.isPending || !reason.trim()}
                 >
                   {decide.isPending && <Spinner data-icon="inline-start" />}
-                  Reject
+                  Ask agent to revise
                 </Button>
               </div>
             </div>
