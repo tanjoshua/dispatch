@@ -1,6 +1,6 @@
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { BotIcon, RotateCcwIcon } from 'lucide-react'
+import { BotIcon, RotateCcwIcon, XIcon } from 'lucide-react'
 import { decideAction, type Action } from '../api'
 import { TimeAgo } from './TimeAgo'
 import { Bubble, BubbleContent } from '@/components/ui/bubble'
@@ -26,18 +26,23 @@ export function draftText(action: Action): string | null {
   return messageText(action.edited_input ?? action.input)
 }
 
-// When the dispatcher sends a draft back for a revision, the superseded draft
-// stays in the thread as a quiet, settled record — not a harsh rejection. It
-// keeps the draft bubble's shape with the strip flipped to "revised", and the
-// dispatcher's instruction quoted underneath, so you can read what you asked
-// for against the fresh draft the agent produced below.
-//
-// On the wire this is still a `reject` decision: the agent loop already treats
-// a rejection as "revise, don't repeat", so "revise" is the honest name for
-// what the mechanism does. A true veto / take-over — where the agent stands
-// down and the dispatcher writes the reply themselves — waits on the dispatcher
-// composer and is deliberately not offered yet.
-export function RevisedDraft({ action }: { action: Action }) {
+// A draft that was decided but never sent stays in the thread as a quiet,
+// settled record — not a harsh rejection. It keeps the draft bubble's shape
+// with the strip flipped to its outcome and a note underneath. Two outcomes
+// share this shell: "revised" (you asked the agent to rewrite it) and
+// "dismissed" (you escaped it; the agent stands down until the customer
+// replies).
+function SettledDraft({
+  action,
+  outcome,
+  icon,
+  note,
+}: {
+  action: Action
+  outcome: string
+  icon: ReactNode
+  note: ReactNode
+}) {
   const text = draftText(action) ?? ''
   return (
     <Message align="end">
@@ -48,22 +53,56 @@ export function RevisedDraft({ action }: { action: Action }) {
               <BotIcon />
               <span>Agent draft</span>
               <span className="opacity-50">·</span>
-              <RotateCcwIcon />
-              <span>revised</span>
+              {icon}
+              <span>{outcome}</span>
             </div>
             <div className="px-3 py-2 text-muted-foreground whitespace-pre-wrap">{text}</div>
           </BubbleContent>
         </Bubble>
-        {action.decision?.reason && (
-          <p className="m-0 max-w-[80%] self-end px-3 text-right text-xs text-muted-foreground">
-            You asked the agent to revise: “{action.decision.reason}”
-          </p>
-        )}
+        {note}
         <MessageFooter>
           <TimeAgo at={action.proposed_at} />
         </MessageFooter>
       </MessageContent>
     </Message>
+  )
+}
+
+// A revised draft: the dispatcher sent it back with an instruction and the
+// agent produced a fresh draft below. On the wire this is a `reject` decision —
+// the agent loop already treats a rejection as "revise, don't repeat", so
+// "revise" is the honest name for what the mechanism does.
+export function RevisedDraft({ action }: { action: Action }) {
+  return (
+    <SettledDraft
+      action={action}
+      outcome="revised"
+      icon={<RotateCcwIcon />}
+      note={
+        action.decision?.reason ? (
+          <p className="m-0 max-w-[80%] self-end px-3 text-right text-xs text-muted-foreground">
+            You asked the agent to revise: “{action.decision.reason}”
+          </p>
+        ) : null
+      }
+    />
+  )
+}
+
+// A dismissed draft: the dispatcher escaped it. The agent stands down for now
+// rather than re-drafting, and re-engages on the customer's next message.
+export function DismissedDraft({ action }: { action: Action }) {
+  return (
+    <SettledDraft
+      action={action}
+      outcome="dismissed"
+      icon={<XIcon />}
+      note={
+        <p className="m-0 max-w-[80%] self-end px-3 text-right text-xs text-muted-foreground">
+          You dismissed this draft — the agent drafts again when the customer replies.
+        </p>
+      }
+    />
   )
 }
 
@@ -111,6 +150,20 @@ export function AgentDraft({ action }: { action: Action }) {
                   <Spinner />
                   <span>sending…</span>
                 </>
+              )}
+              {/* Escape hatch: drop this draft without sending. The agent
+                  stands down and drafts again on the customer's next message. */}
+              {pending && mode === 'idle' && (
+                <button
+                  type="button"
+                  title="Dismiss this draft — the agent drafts again when the customer replies"
+                  onClick={() => decide.mutate({ actionId: action.id, kind: 'dismiss' })}
+                  disabled={decide.isPending}
+                  className="ml-auto -mr-1 rounded p-0.5 text-signal/50 transition-colors hover:bg-signal/10 hover:text-signal disabled:opacity-50"
+                >
+                  <XIcon />
+                  <span className="sr-only">Dismiss draft</span>
+                </button>
               )}
             </div>
             {mode === 'edit' ? (

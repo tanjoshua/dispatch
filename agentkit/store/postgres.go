@@ -83,7 +83,7 @@ func (s *Postgres) RecordDecision(ctx context.Context, actionID string, decision
 	switch decision.Kind {
 	case agentkit.DecisionApproveWithEdits:
 		state = agentkit.ActionApprovedWithEdits
-	case agentkit.DecisionReject:
+	case agentkit.DecisionReject, agentkit.DecisionDismiss:
 		state = agentkit.ActionRejected
 	}
 	err := s.inTx(ctx, func(tx pgx.Tx) error {

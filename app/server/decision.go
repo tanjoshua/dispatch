@@ -9,7 +9,7 @@ import (
 )
 
 type decisionRequest struct {
-	Kind        agentkit.DecisionKind `json:"kind"` // approve | approve_with_edits | reject
+	Kind        agentkit.DecisionKind `json:"kind"` // approve | approve_with_edits | reject | dismiss
 	EditedInput json.RawMessage       `json:"edited_input,omitempty"`
 	Reason      string                `json:"reason,omitempty"`
 	DecidedBy   string                `json:"decided_by,omitempty"`
@@ -46,6 +46,13 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 	case agentkit.DecisionReject:
 		if req.Reason == "" {
 			writeError(w, http.StatusBadRequest, "rejections require a reason")
+			return
+		}
+	case agentkit.DecisionDismiss:
+		// A dismiss is an escape, not coaching: no reason required. It carries
+		// no edited input either.
+		if len(req.EditedInput) > 0 {
+			writeError(w, http.StatusBadRequest, "edited_input requires kind approve_with_edits")
 			return
 		}
 	default:

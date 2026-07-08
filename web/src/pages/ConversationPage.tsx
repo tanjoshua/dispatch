@@ -21,7 +21,13 @@ import {
   type Message,
 } from '../api'
 import { ActionTicket } from '../components/ActionTicket'
-import { AgentDraft, draftText, messageText, RevisedDraft } from '../components/AgentDraft'
+import {
+  AgentDraft,
+  DismissedDraft,
+  draftText,
+  messageText,
+  RevisedDraft,
+} from '../components/AgentDraft'
 import { CustomerComposer } from '../components/CustomerComposer'
 import { JobPanel } from '../components/JobPanel'
 import { TimeAgo } from '../components/TimeAgo'
@@ -122,11 +128,12 @@ function matchSentActions(messages: Message[], actions: Action[]): Map<string, A
 // A proposed reply is a message, so it renders as one: a draft bubble in
 // the thread (AgentDraft). Once it's sent, the real outbound message is the
 // record — its bubble wears the release stamp (and the pre-edit original,
-// if any), so the action row would be a duplicate. Drop it. A draft the
-// dispatcher sent back stays in the thread as a superseded record with the
-// revision instruction attached (RevisedDraft) — the fresh draft the agent
-// produced sits below it. Failed sends and everything else stay work-order
-// tickets.
+// if any), so the action row would be a duplicate. Drop it. A draft that was
+// decided but never sent stays in the thread as a settled record: "revised"
+// (the dispatcher asked for a rewrite, fresh draft below) or "dismissed" (the
+// dispatcher escaped it). Both land in the `rejected` state on the wire and
+// are told apart by the decision kind. Failed sends and everything else stay
+// work-order tickets.
 function renderAction(action: Action) {
   if (action.tool === 'send_message' && draftText(action) != null) {
     switch (action.state) {
@@ -137,7 +144,11 @@ function renderAction(action: Action) {
       case 'executing':
         return <AgentDraft action={action} />
       case 'rejected':
-        return <RevisedDraft action={action} />
+        return action.decision?.kind === 'dismiss' ? (
+          <DismissedDraft action={action} />
+        ) : (
+          <RevisedDraft action={action} />
+        )
       case 'completed':
         return null
     }

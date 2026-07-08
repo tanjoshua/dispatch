@@ -32,6 +32,9 @@ func TestNonRejectionNotRecognized(t *testing.T) {
 		"Tool execution failed: boom",
 		"ok",
 		"The dispatcher approved this action.",
+		// A dismiss (escape) must never read as a revise, or the agent would
+		// re-draft instead of standing down.
+		DismissFeedback(),
 	} {
 		if IsRejectionFeedback(content) {
 			t.Errorf("IsRejectionFeedback(%q) = true, want false", content)

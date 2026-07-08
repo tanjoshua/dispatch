@@ -41,6 +41,12 @@ const (
 	DecisionApprove          DecisionKind = "approve"
 	DecisionApproveWithEdits DecisionKind = "approve_with_edits"
 	DecisionReject           DecisionKind = "reject"
+	// DecisionDismiss drops a proposed action without sending it and without
+	// asking the agent to try again now: the agent stands down for this turn
+	// and re-engages on the next inbound message. Like reject, the action ends
+	// unexecuted (ActionRejected state); unlike reject, no reason is required
+	// and the agent does not immediately re-propose.
+	DecisionDismiss DecisionKind = "dismiss"
 )
 
 // DecidedByPolicy is the DecidedBy value for policy auto-approvals.
@@ -50,7 +56,7 @@ const DecidedByPolicy = "policy:auto"
 type Decision struct {
 	Kind      DecisionKind `json:"kind"`
 	DecidedBy string       `json:"decided_by"` // user ID, or DecidedByPolicy
-	Reason    string       `json:"reason"`     // required for reject; free text otherwise
+	Reason    string       `json:"reason"`     // required for reject; optional for dismiss; free text otherwise
 }
 
 // Action is one proposed tool call with its full review lifecycle.

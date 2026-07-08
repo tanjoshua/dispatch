@@ -115,6 +115,7 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh workflow.ReceiveChann
 		}
 
 		var results []llm.ToolResult
+		yield := false
 		for _, call := range calls {
 			outcome, err := decideAndExecute(actCtx, decisionCh, input, call)
 			if err != nil {
@@ -124,15 +125,33 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh workflow.ReceiveChann
 			if outcome.Terminal {
 				terminal = true
 			}
+			if isDismissed(outcome.Action) {
+				yield = true
+			}
 		}
 		// All results for one assistant turn go back in a single message.
 		*messages = append(*messages, llm.ToolResults(results...))
 		if terminal {
 			return true, nil
 		}
+		if yield {
+			// The dispatcher dismissed a draft: the agent stands down for now
+			// rather than re-drafting. Stop the turn and wait for the next
+			// inbound message, which re-engages the agent (the dismissal stays
+			// in context, so it drafts fresh and aware). The tool results are
+			// already appended above, keeping the history valid for that turn.
+			return false, nil
+		}
 		// Loop: the agent sees decisions/results and may revise (e.g. after
 		// a rejection) or propose further actions.
 	}
+}
+
+// isDismissed reports whether an action was resolved by a dispatcher dismissal
+// (escape) rather than an approval or a revise-style rejection.
+func isDismissed(action *agentkit.Action) bool {
+	return action != nil && action.Decision != nil &&
+		action.Decision.Kind == agentkit.DecisionDismiss
 }
 
 // decideAndExecute takes one tool call through the full action pipeline.
@@ -211,12 +230,26 @@ func IsRejectionFeedback(content string) bool {
 	return strings.HasPrefix(content, rejectionFeedbackPrefix)
 }
 
+// DismissFeedback renders the tool-result content the agent sees when a
+// dispatcher dismisses (escapes) a draft. Unlike a rejection it does not ask
+// for a revised proposal now: the agent stands down until the customer's next
+// message. The workflow also hard-yields the turn, so this text mainly informs
+// the agent on the next turn; it must NOT be recognized as rejection feedback,
+// or a re-drafting loop would treat the escape as a revise.
+func DismissFeedback() string {
+	return "The dispatcher dismissed this draft and is handling the conversation for now. " +
+		"Do not send another message; wait for the customer's next message before responding again."
+}
+
 // feedback renders an action's outcome as the tool result the agent sees —
-// including rejections (with reason) and human edits, so the agent revises
-// rather than repeats.
+// including rejections (with reason), dismissals, and human edits, so the agent
+// revises, stands down, or proceeds rather than blindly repeating.
 func feedback(action *agentkit.Action, call llm.ToolCall) llm.ToolResult {
 	switch action.State {
 	case agentkit.ActionRejected:
+		if action.Decision != nil && action.Decision.Kind == agentkit.DecisionDismiss {
+			return llm.ToolResult{ToolCallID: call.ID, Content: DismissFeedback()}
+		}
 		return llm.ToolResult{ToolCallID: call.ID, Content: RejectionFeedback(action.Decision.Reason)}
 	case agentkit.ActionFailed:
 		return llm.ToolResult{ToolCallID: call.ID, Content: "Tool execution failed: " + action.Error, IsError: true}

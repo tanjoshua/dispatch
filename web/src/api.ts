@@ -11,7 +11,7 @@ export type ActionState =
   | 'completed'
   | 'failed'
 
-export type DecisionKind = 'approve' | 'approve_with_edits' | 'reject'
+export type DecisionKind = 'approve' | 'approve_with_edits' | 'reject' | 'dismiss'
 
 export interface Decision {
   kind: DecisionKind
