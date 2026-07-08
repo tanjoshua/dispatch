@@ -32,6 +32,14 @@ import (
 
 type OutboundMessage struct {
 	Body string `json:"body"`
+	// Author is who is sending — the agent (a send_message Action) or a
+	// dispatcher replying directly (design/003). Adapters persist it so the UI
+	// and the agent context can tell them apart; it does not affect transport.
+	Author domain.MessageAuthor `json:"author"`
+	// ID optionally pins the persisted message's ID so the caller can reference
+	// it (e.g. the dispatcher-reply endpoint needs it for the event + signal).
+	// Empty means the adapter assigns one.
+	ID string `json:"id,omitempty"`
 }
 
 // InboundMessage is a normalized message arriving on a connection: who it is
@@ -153,6 +161,7 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 		OrgID:          conn.OrgID,
 		ConversationID: conv.ID,
 		Direction:      domain.Inbound,
+		Author:         domain.AuthorCustomer,
 		Body:           in.Text,
 	}
 	if err := r.store.AddMessage(ctx, msg); err != nil {

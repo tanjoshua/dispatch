@@ -41,12 +41,21 @@ const (
 	DecisionApprove          DecisionKind = "approve"
 	DecisionApproveWithEdits DecisionKind = "approve_with_edits"
 	DecisionReject           DecisionKind = "reject"
-	// DecisionDismiss drops a proposed action without sending it and without
-	// asking the agent to try again now: the agent stands down for this turn
-	// and re-engages on the next inbound message. Like reject, the action ends
-	// unexecuted (ActionRejected state); unlike reject, no reason is required
-	// and the agent does not immediately re-propose.
+	// DecisionDismiss discards a proposed action: it is not sent, and the agent
+	// is not asked to try again now. Like reject, the action ends unexecuted
+	// (ActionRejected state); unlike reject, no reason is required and the agent
+	// does not immediately re-propose — it waits for the next inbound message,
+	// the same as after any completed turn. (This is a plain "not this draft",
+	// not a control handoff — see design/003-dispatcher-as-participant.md.)
 	DecisionDismiss DecisionKind = "dismiss"
+	// DecisionSupersede withdraws a pending action because a human participant
+	// acted directly instead — e.g. a dispatcher replied to the customer in
+	// their own words rather than deciding on the agent's draft. The action ends
+	// unexecuted (ActionRejected state); the human's act (delivered and recorded
+	// separately) is what reached the customer. Not a user-supplied decision on
+	// the review endpoint — the workflow records it when a direct human message
+	// arrives while a draft is pending.
+	DecisionSupersede DecisionKind = "supersede"
 )
 
 // DecidedByPolicy is the DecidedBy value for policy auto-approvals.

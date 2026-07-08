@@ -16,6 +16,12 @@ import (
 const (
 	SignalInboundMessage = "inbound_message"
 	SignalDecision       = "decision"
+	// SignalDispatcherMessage carries a message a human participant (the
+	// dispatcher) sent directly to the customer, so the agent's shared context
+	// includes it (design/003-dispatcher-as-participant.md). The message is
+	// already delivered and persisted before the signal fires; the payload is
+	// just id + text, keeping the signal small.
+	SignalDispatcherMessage = "dispatcher_message"
 )
 
 // AgentDefinition is everything the loop needs to run one kind of agent:
@@ -76,6 +82,13 @@ type AgentLoopInput struct {
 // InboundMessage is the inbound_message signal payload. Channel adapters
 // persist the message and its event first, then signal.
 type InboundMessage struct {
+	MessageID string `json:"message_id"`
+	Text      string `json:"text"`
+}
+
+// DispatcherMessageSignal is the dispatcher_message signal payload: a message a
+// human sent directly to the customer, carried into the run for agent context.
+type DispatcherMessageSignal struct {
 	MessageID string `json:"message_id"`
 	Text      string `json:"text"`
 }

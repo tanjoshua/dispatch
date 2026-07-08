@@ -59,7 +59,7 @@ func (t *sendMessageTool) Execute(ctx context.Context, input json.RawMessage) (j
 	if err != nil {
 		return nil, err
 	}
-	if err := t.sender.Send(ctx, conv.ID, channel.OutboundMessage{Body: in.Message}); err != nil {
+	if err := t.sender.Send(ctx, conv.ID, channel.OutboundMessage{Body: in.Message, Author: domain.AuthorAgent}); err != nil {
 		return nil, fmt.Errorf("send_message: %w", err)
 	}
 	return json.RawMessage(`{"status":"sent"}`), nil

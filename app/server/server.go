@@ -22,6 +22,10 @@ type Server struct {
 	Agentkit akstore.Store
 	Temporal temporalclient.Client
 	Router   *channel.Router
+	// Sender is the shared outbound path, used when a dispatcher replies to the
+	// customer directly (design/003-dispatcher-as-participant.md). It is the same
+	// path the agent's send_message tool uses.
+	Sender *channel.Sender
 	// DefaultOrgID scopes the read API (conversation list) until auth lands (a
 	// 000 §8 non-goal). The inbound path no longer reads an org global — it
 	// resolves org from the channel connection (design/002).
@@ -35,6 +39,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/conversations", s.handleListConversations)
 	mux.HandleFunc("GET /api/conversations/{id}", s.handleGetConversation)
 	mux.HandleFunc("POST /api/actions/{id}/decision", s.handleDecision)
+	mux.HandleFunc("POST /api/conversations/{id}/reply", s.handleDispatcherReply)
 	mux.HandleFunc("POST /api/conversations/{id}/acknowledge", s.handleAcknowledge)
 	mux.HandleFunc("GET /api/runs/{id}/events", s.handleRunEvents)
 	return cors(mux)

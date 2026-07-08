@@ -35,6 +35,9 @@ func TestNonRejectionNotRecognized(t *testing.T) {
 		// A dismiss (escape) must never read as a revise, or the agent would
 		// re-draft instead of standing down.
 		DismissFeedback(),
+		// A supersede (dispatcher answered directly) likewise stands the agent
+		// down; it must not read as a revise.
+		SupersedeFeedback(),
 	} {
 		if IsRejectionFeedback(content) {
 			t.Errorf("IsRejectionFeedback(%q) = true, want false", content)

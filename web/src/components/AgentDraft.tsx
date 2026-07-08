@@ -1,6 +1,6 @@
 import { useState, type ReactNode } from 'react'
 import { useMutation, useQueryClient } from '@tanstack/react-query'
-import { BotIcon, RotateCcwIcon, XIcon } from 'lucide-react'
+import { BotIcon, RotateCcwIcon, UserIcon, XIcon } from 'lucide-react'
 import { decideAction, type Action } from '../api'
 import { TimeAgo } from './TimeAgo'
 import { Bubble, BubbleContent } from '@/components/ui/bubble'
@@ -89,8 +89,8 @@ export function RevisedDraft({ action }: { action: Action }) {
   )
 }
 
-// A dismissed draft: the dispatcher escaped it. The agent stands down for now
-// rather than re-drafting, and re-engages on the customer's next message.
+// A dismissed draft: the dispatcher discarded it without sending. The agent
+// doesn't re-draft now; it drafts again on the customer's next message.
 export function DismissedDraft({ action }: { action: Action }) {
   return (
     <SettledDraft
@@ -100,6 +100,24 @@ export function DismissedDraft({ action }: { action: Action }) {
       note={
         <p className="m-0 max-w-[80%] self-end px-3 text-right text-xs text-muted-foreground">
           You dismissed this draft — the agent drafts again when the customer replies.
+        </p>
+      }
+    />
+  )
+}
+
+// A superseded draft: the dispatcher replied to the customer directly instead
+// of sending this draft, so the workflow withdrew it (a `supersede` decision).
+// The dispatcher's own message is what reached the customer.
+export function SupersededDraft({ action }: { action: Action }) {
+  return (
+    <SettledDraft
+      action={action}
+      outcome="superseded"
+      icon={<UserIcon />}
+      note={
+        <p className="m-0 max-w-[80%] self-end px-3 text-right text-xs text-muted-foreground">
+          You replied to the customer directly — the agent didn’t send this draft.
         </p>
       }
     />

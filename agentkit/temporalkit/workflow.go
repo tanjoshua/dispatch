@@ -48,33 +48,73 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 	messages := input.Messages
 	inboundCh := workflow.GetSignalChannel(ctx, SignalInboundMessage)
 	decisionCh := workflow.GetSignalChannel(ctx, SignalDecision)
+	dispatcherCh := workflow.GetSignalChannel(ctx, SignalDispatcherMessage)
 
 	for {
-		// Durable wait for the next customer message; drain any backlog.
-		var msg InboundMessage
-		inboundCh.Receive(ctx, &msg)
-		messages = append(messages, llm.UserText(msg.Text))
-		for inboundCh.ReceiveAsync(&msg) {
-			messages = append(messages, llm.UserText(msg.Text))
+		// Durable wait: block until the customer or the dispatcher says
+		// something, then absorb any backlog. Both land in the shared context;
+		// the agent runs a turn only when the *customer* spoke — a dispatcher
+		// message informs the agent without provoking it to talk over a human
+		// who is handling the conversation (design/003-dispatcher-as-participant.md).
+		sawCustomer := awaitContext(ctx, inboundCh, dispatcherCh, &messages)
+		if sawCustomer {
+			terminal, err := agentTurn(llmCtx, actCtx, decisionCh, dispatcherCh, input, &messages)
+			if err != nil {
+				finishRun(actCtx, input, agentkit.RunFailed, logger)
+				return err
+			}
+			if terminal {
+				return finishRun(actCtx, input, agentkit.RunCompleted, logger)
+			}
 		}
 
-		terminal, err := agentTurn(llmCtx, actCtx, decisionCh, input, &messages)
-		if err != nil {
-			finishRun(actCtx, input, agentkit.RunFailed, logger)
-			return err
-		}
-		if terminal {
-			return finishRun(actCtx, input, agentkit.RunCompleted, logger)
-		}
-
-		// Between customer turns is the safe point to roll over a long
-		// history. Conversation context is carried in the new input.
-		if workflow.GetInfo(ctx).GetContinueAsNewSuggested() && inboundCh.Len() == 0 {
+		// Between turns is the safe point to roll over a long history.
+		// Conversation context is carried in the new input.
+		if workflow.GetInfo(ctx).GetContinueAsNewSuggested() && inboundCh.Len() == 0 && dispatcherCh.Len() == 0 {
 			next := input
 			next.Messages = messages
 			return workflow.NewContinueAsNewError(ctx, AgentLoopWorkflowName, next)
 		}
 	}
+}
+
+// awaitContext blocks until at least one inbound or dispatcher message is
+// available, then drains all buffered messages of both kinds into the shared
+// context. It reports whether any *customer* (inbound) message arrived — the
+// trigger for an agent turn. A dispatcher message updates context without
+// provoking a turn.
+func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh workflow.ReceiveChannel, messages *[]llm.Message) bool {
+	sawCustomer := false
+	sel := workflow.NewSelector(ctx)
+	sel.AddReceive(inboundCh, func(c workflow.ReceiveChannel, _ bool) {
+		var m InboundMessage
+		c.Receive(ctx, &m)
+		*messages = append(*messages, llm.UserText(m.Text))
+		sawCustomer = true
+	})
+	sel.AddReceive(dispatcherCh, func(c workflow.ReceiveChannel, _ bool) {
+		var m DispatcherMessageSignal
+		c.Receive(ctx, &m)
+		*messages = append(*messages, DispatcherContextMessage(m.Text))
+	})
+	sel.Select(ctx) // block for the first
+	// Drain the rest without blocking, checking both kinds each pass so a
+	// backlog stays roughly in arrival order.
+	for {
+		var in InboundMessage
+		if inboundCh.ReceiveAsync(&in) {
+			*messages = append(*messages, llm.UserText(in.Text))
+			sawCustomer = true
+			continue
+		}
+		var dm DispatcherMessageSignal
+		if dispatcherCh.ReceiveAsync(&dm) {
+			*messages = append(*messages, DispatcherContextMessage(dm.Text))
+			continue
+		}
+		break
+	}
+	return sawCustomer
 }
 
 func finishRun(actCtx workflow.Context, input AgentLoopInput, status agentkit.RunStatus, logger log.Logger) error {
@@ -91,7 +131,7 @@ func finishRun(actCtx workflow.Context, input AgentLoopInput, status agentkit.Ru
 
 // agentTurn runs LLM completions until the agent stops proposing tool calls
 // or a terminal tool executes successfully.
-func agentTurn(llmCtx, actCtx workflow.Context, decisionCh workflow.ReceiveChannel, input AgentLoopInput, messages *[]llm.Message) (terminal bool, err error) {
+func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, messages *[]llm.Message) (terminal bool, err error) {
 	logger := workflow.GetLogger(llmCtx)
 
 	for {
@@ -115,9 +155,10 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh workflow.ReceiveChann
 		}
 
 		var results []llm.ToolResult
-		yield := false
+		var notes []string // dispatcher messages that arrived mid-turn
+		standDown := false // a draft was dismissed or superseded: end the turn
 		for _, call := range calls {
-			outcome, err := decideAndExecute(actCtx, decisionCh, input, call)
+			outcome, note, err := decideAndExecute(actCtx, decisionCh, dispatcherCh, input, call)
 			if err != nil {
 				return false, err
 			}
@@ -125,21 +166,25 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh workflow.ReceiveChann
 			if outcome.Terminal {
 				terminal = true
 			}
-			if isDismissed(outcome.Action) {
-				yield = true
+			if isStandDown(outcome.Action) {
+				standDown = true
+			}
+			if note != "" {
+				notes = append(notes, note)
 			}
 		}
-		// All results for one assistant turn go back in a single message.
-		*messages = append(*messages, llm.ToolResults(results...))
+		// All results for one assistant turn go back in a single user message;
+		// any dispatcher messages that arrived during the turn ride along in
+		// that same turn, keeping conversation roles alternating.
+		*messages = append(*messages, toolResultsWithNotes(results, notes))
 		if terminal {
 			return true, nil
 		}
-		if yield {
-			// The dispatcher dismissed a draft: the agent stands down for now
-			// rather than re-drafting. Stop the turn and wait for the next
-			// inbound message, which re-engages the agent (the dismissal stays
-			// in context, so it drafts fresh and aware). The tool results are
-			// already appended above, keeping the history valid for that turn.
+		if standDown {
+			// The dispatcher dismissed a draft, or answered the customer
+			// directly. The agent does not re-draft now; it waits for the
+			// customer's next message, which re-engages it with full context
+			// (the dismissal/dispatcher reply is already in context above).
 			return false, nil
 		}
 		// Loop: the agent sees decisions/results and may revise (e.g. after
@@ -147,15 +192,32 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh workflow.ReceiveChann
 	}
 }
 
-// isDismissed reports whether an action was resolved by a dispatcher dismissal
-// (escape) rather than an approval or a revise-style rejection.
-func isDismissed(action *agentkit.Action) bool {
-	return action != nil && action.Decision != nil &&
-		action.Decision.Kind == agentkit.DecisionDismiss
+// isStandDown reports whether an action was resolved in a way that ends the
+// agent's turn without re-drafting: a dispatcher dismissal (escape) or a
+// supersede (the dispatcher answered the customer directly).
+func isStandDown(action *agentkit.Action) bool {
+	if action == nil || action.Decision == nil {
+		return false
+	}
+	return action.Decision.Kind == agentkit.DecisionDismiss ||
+		action.Decision.Kind == agentkit.DecisionSupersede
 }
 
-// decideAndExecute takes one tool call through the full action pipeline.
-func decideAndExecute(actCtx workflow.Context, decisionCh workflow.ReceiveChannel, input AgentLoopInput, call llm.ToolCall) (*ExecuteActionResult, error) {
+// toolResultsWithNotes packs one assistant turn's tool results, plus any
+// dispatcher messages that arrived during the turn, into a single user turn.
+func toolResultsWithNotes(results []llm.ToolResult, notes []string) llm.Message {
+	m := llm.ToolResults(results...)
+	for _, n := range notes {
+		m.Content = append(m.Content, llm.ContentBlock{Type: "text", Text: n})
+	}
+	return m
+}
+
+// decideAndExecute takes one tool call through the full action pipeline. While a
+// proposed action waits for a human decision, a dispatcher message may arrive
+// instead — the human answered the customer directly — which supersedes the
+// pending action and returns the dispatcher's text as a context note.
+func decideAndExecute(actCtx workflow.Context, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, call llm.ToolCall) (*ExecuteActionResult, string, error) {
 	logger := workflow.GetLogger(actCtx)
 
 	var action agentkit.Action
@@ -166,14 +228,52 @@ func decideAndExecute(actCtx workflow.Context, decisionCh workflow.ReceiveChanne
 		Call:  call,
 	}).Get(actCtx, &action)
 	if err != nil {
-		return nil, fmt.Errorf("propose action: %w", err)
+		return nil, "", fmt.Errorf("propose action: %w", err)
 	}
 
-	// HITL is policy, not architecture: the wait only happens when the
-	// policy said RequireApproval. Durable — a decision can take days.
+	// HITL is policy, not architecture: the wait only happens when the policy
+	// said RequireApproval. Durable — a decision can take days. The dispatcher
+	// can also message the customer directly at any time, which supersedes this
+	// draft rather than deciding on it (design/003-dispatcher-as-participant.md).
+	note := ""
 	for action.State == agentkit.ActionPendingApproval {
-		var decision DecisionSignal
-		decisionCh.Receive(actCtx, &decision)
+		var decision *DecisionSignal
+		var disp *DispatcherMessageSignal
+		sel := workflow.NewSelector(actCtx)
+		sel.AddReceive(decisionCh, func(c workflow.ReceiveChannel, _ bool) {
+			var d DecisionSignal
+			c.Receive(actCtx, &d)
+			decision = &d
+		})
+		sel.AddReceive(dispatcherCh, func(c workflow.ReceiveChannel, _ bool) {
+			var m DispatcherMessageSignal
+			c.Receive(actCtx, &m)
+			disp = &m
+		})
+		sel.Select(actCtx)
+
+		if disp != nil {
+			// The dispatcher answered directly. Withdraw this draft as
+			// superseded and carry their message into context. The message is
+			// already delivered + persisted by the reply endpoint; here we only
+			// resolve the action and note the text for the agent.
+			err := workflow.ExecuteActivity(actCtx, "RecordDecision", RecordDecisionInput{
+				OrgID: input.OrgID,
+				RunID: input.RunID,
+				Decision: DecisionSignal{
+					ActionID:  action.ID,
+					Kind:      agentkit.DecisionSupersede,
+					DecidedBy: "dispatcher",
+					Reason:    "dispatcher replied to the customer directly",
+				},
+			}).Get(actCtx, &action)
+			if err != nil {
+				return nil, "", fmt.Errorf("record decision: %w", err)
+			}
+			note = DispatcherNote(disp.Text)
+			continue
+		}
+
 		if decision.ActionID != action.ID {
 			logger.Warn("decision for unexpected action ignored", "got", decision.ActionID, "want", action.ID)
 			continue
@@ -181,10 +281,10 @@ func decideAndExecute(actCtx workflow.Context, decisionCh workflow.ReceiveChanne
 		err := workflow.ExecuteActivity(actCtx, "RecordDecision", RecordDecisionInput{
 			OrgID:    input.OrgID,
 			RunID:    input.RunID,
-			Decision: decision,
+			Decision: *decision,
 		}).Get(actCtx, &action)
 		if err != nil {
-			return nil, fmt.Errorf("record decision: %w", err)
+			return nil, "", fmt.Errorf("record decision: %w", err)
 		}
 	}
 
@@ -195,11 +295,11 @@ func decideAndExecute(actCtx workflow.Context, decisionCh workflow.ReceiveChanne
 			Agent:    input.Agent,
 		}).Get(actCtx, &result)
 		if err != nil {
-			return nil, fmt.Errorf("execute action: %w", err)
+			return nil, "", fmt.Errorf("execute action: %w", err)
 		}
-		return &result, nil
+		return &result, note, nil
 	}
-	return &ExecuteActionResult{Action: &action}, nil
+	return &ExecuteActionResult{Action: &action}, note, nil
 }
 
 // rejectionFeedbackPrefix opens the tool-result content the agent sees when a
@@ -231,24 +331,52 @@ func IsRejectionFeedback(content string) bool {
 }
 
 // DismissFeedback renders the tool-result content the agent sees when a
-// dispatcher dismisses (escapes) a draft. Unlike a rejection it does not ask
-// for a revised proposal now: the agent stands down until the customer's next
-// message. The workflow also hard-yields the turn, so this text mainly informs
-// the agent on the next turn; it must NOT be recognized as rejection feedback,
-// or a re-drafting loop would treat the escape as a revise.
+// dispatcher dismisses (escapes) a draft: it was not sent, and the agent is not
+// asked to revise now. It waits for the customer's next message before drafting
+// again — the same as after any completed turn (this is "not this draft", not a
+// control handoff; see design/003). It must NOT be recognized as rejection
+// feedback, or a re-drafting loop would treat the escape as a revise.
 func DismissFeedback() string {
-	return "The dispatcher dismissed this draft and is handling the conversation for now. " +
-		"Do not send another message; wait for the customer's next message before responding again."
+	return "The dispatcher chose not to send this draft. " +
+		"Do not re-send it now; wait for the customer's next message before drafting again."
+}
+
+// SupersedeFeedback renders the tool-result content the agent sees when a
+// dispatcher answered the customer directly instead of ruling on this draft.
+// The dispatcher's own message (delivered to the customer) is added to the
+// context alongside this result via DispatcherNote, so the agent knows what was
+// said. Like a dismiss, the agent stands down for this turn.
+func SupersedeFeedback() string {
+	return "The dispatcher replied to the customer directly instead of sending this draft, " +
+		"so it was not sent. Their message is shown below. " +
+		"Do not repeat it; wait for the customer's next message before drafting again."
+}
+
+// DispatcherNote renders a message the dispatcher sent directly to the customer
+// as an agent-facing context note, clearly attributed to the human operator so
+// the agent never mistakes it for its own words or for the customer's.
+func DispatcherNote(text string) string {
+	return "[The human dispatcher sent this message to the customer directly]\n" + text
+}
+
+// DispatcherContextMessage wraps a dispatcher's direct message as a
+// conversation turn for the agent's context (a labeled user turn — it is
+// information the agent receives, not something it authored).
+func DispatcherContextMessage(text string) llm.Message {
+	return llm.UserText(DispatcherNote(text))
 }
 
 // feedback renders an action's outcome as the tool result the agent sees —
-// including rejections (with reason), dismissals, and human edits, so the agent
-// revises, stands down, or proceeds rather than blindly repeating.
+// including rejections (with reason), dismissals, supersedes, and human edits,
+// so the agent revises, stands down, or proceeds rather than blindly repeating.
 func feedback(action *agentkit.Action, call llm.ToolCall) llm.ToolResult {
 	switch action.State {
 	case agentkit.ActionRejected:
 		if action.Decision != nil && action.Decision.Kind == agentkit.DecisionDismiss {
 			return llm.ToolResult{ToolCallID: call.ID, Content: DismissFeedback()}
+		}
+		if action.Decision != nil && action.Decision.Kind == agentkit.DecisionSupersede {
+			return llm.ToolResult{ToolCallID: call.ID, Content: SupersedeFeedback()}
 		}
 		return llm.ToolResult{ToolCallID: call.ID, Content: RejectionFeedback(action.Decision.Reason)}
 	case agentkit.ActionFailed:

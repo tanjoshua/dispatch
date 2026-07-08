@@ -11,7 +11,15 @@ export type ActionState =
   | 'completed'
   | 'failed'
 
-export type DecisionKind = 'approve' | 'approve_with_edits' | 'reject' | 'dismiss'
+export type DecisionKind =
+  | 'approve'
+  | 'approve_with_edits'
+  | 'reject'
+  | 'dismiss'
+  // Recorded by the workflow when a dispatcher replies to the customer directly
+  // while a draft is pending — the draft is withdrawn, not sent. Never sent from
+  // the client (design/003-dispatcher-as-participant.md).
+  | 'supersede'
 
 export interface Decision {
   kind: DecisionKind
@@ -65,10 +73,13 @@ export interface Conversation {
   updated_at: string
 }
 
+export type MessageAuthor = 'customer' | 'agent' | 'dispatcher'
+
 export interface Message {
   id: string
   conversation_id: string
   direction: 'inbound' | 'outbound'
+  author: MessageAuthor
   body: string
   created_at: string
 }
@@ -132,6 +143,19 @@ export function sendInbound(input: { phone: string; name: string; text: string }
     method: 'POST',
     body: JSON.stringify(input),
   })
+}
+
+// sendDispatcherReply posts a message the dispatcher types straight to the
+// customer — a first-class participant reply, not an agent action
+// (design/003-dispatcher-as-participant.md).
+export function sendDispatcherReply(input: { conversationId: string; text: string }) {
+  return request<{ status: string; message_id: string }>(
+    `/api/conversations/${input.conversationId}/reply`,
+    {
+      method: 'POST',
+      body: JSON.stringify({ text: input.text, sent_by: 'dispatcher' }),
+    },
+  )
 }
 
 export function acknowledgeEscalation(input: { conversationId: string; note?: string }) {

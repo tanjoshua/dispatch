@@ -81,13 +81,25 @@ const (
 	Outbound Direction = "outbound" // to the customer
 )
 
+// MessageAuthor is who wrote a message. The dispatcher is a first-class
+// participant (design/003-dispatcher-as-participant.md), so an outbound message
+// is the agent's or the dispatcher's; inbound is always the customer's.
+type MessageAuthor string
+
+const (
+	AuthorCustomer   MessageAuthor = "customer"   // inbound
+	AuthorAgent      MessageAuthor = "agent"      // outbound via a send_message Action
+	AuthorDispatcher MessageAuthor = "dispatcher" // outbound, sent directly by a human dispatcher
+)
+
 type Message struct {
-	ID             string    `json:"id"`
-	OrgID          string    `json:"org_id"`
-	ConversationID string    `json:"conversation_id"`
-	Direction      Direction `json:"direction"`
-	Body           string    `json:"body"`
-	CreatedAt      time.Time `json:"created_at"`
+	ID             string        `json:"id"`
+	OrgID          string        `json:"org_id"`
+	ConversationID string        `json:"conversation_id"`
+	Direction      Direction     `json:"direction"`
+	Author         MessageAuthor `json:"author"`
+	Body           string        `json:"body"`
+	CreatedAt      time.Time     `json:"created_at"`
 }
 
 type JobStatus string

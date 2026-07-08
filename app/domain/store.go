@@ -218,10 +218,10 @@ func (s *Store) AddMessage(ctx context.Context, m Message) error {
 	}
 	defer tx.Rollback(ctx)
 	tag, err := tx.Exec(ctx, `
-		INSERT INTO messages (id, org_id, conversation_id, direction, body)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO messages (id, org_id, conversation_id, direction, author, body)
+		VALUES ($1, $2, $3, $4, $5, $6)
 		ON CONFLICT (id) DO NOTHING`,
-		m.ID, m.OrgID, m.ConversationID, m.Direction, m.Body)
+		m.ID, m.OrgID, m.ConversationID, m.Direction, m.Author, m.Body)
 	if err != nil {
 		return err
 	}
@@ -236,7 +236,7 @@ func (s *Store) AddMessage(ctx context.Context, m Message) error {
 
 func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]Message, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, org_id, conversation_id, direction, body, created_at
+		SELECT id, org_id, conversation_id, direction, author, body, created_at
 		FROM messages WHERE conversation_id = $1 ORDER BY created_at, id`, conversationID)
 	if err != nil {
 		return nil, err
@@ -245,7 +245,7 @@ func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]Mess
 	var out []Message
 	for rows.Next() {
 		var m Message
-		if err := rows.Scan(&m.ID, &m.OrgID, &m.ConversationID, &m.Direction, &m.Body, &m.CreatedAt); err != nil {
+		if err := rows.Scan(&m.ID, &m.OrgID, &m.ConversationID, &m.Direction, &m.Author, &m.Body, &m.CreatedAt); err != nil {
 			return nil, err
 		}
 		out = append(out, m)

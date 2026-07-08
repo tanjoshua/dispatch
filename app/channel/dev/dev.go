@@ -33,11 +33,20 @@ func (a *Adapter) Kind() string { return Name }
 // Deliver writes the outbound message to the conversation; the UI pane renders
 // it. This is the only kind-specific behavior — everything upstream is shared.
 func (a *Adapter) Deliver(ctx context.Context, d channel.Delivery) error {
+	author := d.Msg.Author
+	if author == "" {
+		author = domain.AuthorAgent
+	}
+	id := d.Msg.ID
+	if id == "" {
+		id = agentkit.NewID()
+	}
 	return a.store.AddMessage(ctx, domain.Message{
-		ID:             agentkit.NewID(),
+		ID:             id,
 		OrgID:          d.Conn.OrgID,
 		ConversationID: d.ConversationID,
 		Direction:      domain.Outbound,
+		Author:         author,
 		Body:           d.Msg.Body,
 	})
 }

@@ -52,6 +52,17 @@ end-to-end._
       endpoint/event; dispatcher UI flags to top with safety-orange +
       Acknowledge. Agent escalates from judgment (no keyword rules); keyless
       demo LLM does not simulate it — exercised by the real agent
+- [x] Dispatcher as participant (`design/003-dispatcher-as-participant.md`):
+      the dispatcher can reply to the customer directly at any time
+      (`POST /api/conversations/{id}/reply`) — no "agent's turn" / takeover.
+      Messages carry an `author` (customer | agent | dispatcher, migration
+      `0004`); a dispatcher reply goes out the shared `Sender` path, is recorded
+      as a `dispatcher_message` event, and is signaled into the run's context so
+      the agent's next turn is fully informed. A pending draft is `supersede`d
+      when the dispatcher answers directly. `Dismiss` reframed to "discard this
+      draft" (no takeover). UI: a dispatcher reply composer at the foot of the
+      thread; dispatcher-authored bubbles stamped distinctly. Agent turns stay
+      customer-driven; a dispatcher message is context, not a trigger
 - [x] Org & channel connections (`design/002-organization-and-channels.md`):
       `organizations` + `channel_connections` tables (migration `0003`,
       seeds `org_dev` + `chan_dev`); channel split into per-kind `Adapter`
@@ -98,7 +109,9 @@ end-to-end._
       (Meta/Twilio), auto-approval policy demo ("the slider"), scheduling /
       follow-up agents, authn/authz, multi-org, learned confidence
 - [ ] Escalation follow-ups (`design/001-escalation.md` §6 Future):
-      context-aware auto-approval of safety messages while escalated, human
-      takeover, external notification (push/SMS), agentkit attention primitive
+      context-aware auto-approval of safety messages while escalated, external
+      notification (push/SMS), agentkit attention primitive. (Human takeover is
+      no longer planned — superseded by `design/003`: the dispatcher is always a
+      participant, so there is no turn to take over.)
 - [ ] Open questions in design doc §11 (run granularity, decision timeouts,
       concurrent/batched actions, learning from edits)

@@ -14,6 +14,7 @@ import (
 	"dispatch/app"
 	"dispatch/app/agents/intake"
 	"dispatch/app/channel"
+	"dispatch/app/channel/dev"
 	"dispatch/app/domain"
 	"dispatch/app/server"
 )
@@ -44,11 +45,13 @@ func main() {
 
 	domainStore := domain.NewStore(pool)
 	akStore := akstore.NewPostgres(pool)
+	sender := channel.NewSender(domainStore, channel.NewRegistry(dev.New(domainStore)))
 	srv := &server.Server{
 		Domain:       domainStore,
 		Agentkit:     akStore,
 		Temporal:     tc,
 		Router:       channel.NewRouter(domainStore, akStore, tc, app.TaskQueue, intake.AgentName),
+		Sender:       sender,
 		DefaultOrgID: app.OrgID,
 	}
 

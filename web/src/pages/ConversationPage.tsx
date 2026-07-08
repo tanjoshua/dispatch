@@ -9,6 +9,7 @@ import {
   PencilLineIcon,
   ShieldCheckIcon,
   TriangleAlertIcon,
+  UserIcon,
   ZapIcon,
 } from 'lucide-react'
 import {
@@ -27,8 +28,10 @@ import {
   draftText,
   messageText,
   RevisedDraft,
+  SupersededDraft,
 } from '../components/AgentDraft'
 import { CustomerComposer } from '../components/CustomerComposer'
+import { DispatcherComposer } from '../components/DispatcherComposer'
 import { JobPanel } from '../components/JobPanel'
 import { TimeAgo } from '../components/TimeAgo'
 import { Badge } from '@/components/ui/badge'
@@ -112,8 +115,10 @@ function matchSentActions(messages: Message[], actions: Action[]): Map<string, A
     .sort((a, b) => a.proposed_at.localeCompare(b.proposed_at))
   const used = new Set<string>()
   const byMessage = new Map<string, Action>()
+  // Only agent-authored outbound messages come from a send_message action;
+  // dispatcher replies have no backing action, so they never match one.
   const outbound = messages
-    .filter((m) => m.direction === 'outbound')
+    .filter((m) => m.direction === 'outbound' && m.author === 'agent')
     .sort((a, b) => a.created_at.localeCompare(b.created_at))
   for (const message of outbound) {
     const match = sends.find((a) => !used.has(a.id) && draftText(a) === message.body)
@@ -144,11 +149,14 @@ function renderAction(action: Action) {
       case 'executing':
         return <AgentDraft action={action} />
       case 'rejected':
-        return action.decision?.kind === 'dismiss' ? (
-          <DismissedDraft action={action} />
-        ) : (
-          <RevisedDraft action={action} />
-        )
+        switch (action.decision?.kind) {
+          case 'dismiss':
+            return <DismissedDraft action={action} />
+          case 'supersede':
+            return <SupersededDraft action={action} />
+          default:
+            return <RevisedDraft action={action} />
+        }
       case 'completed':
         return null
     }
@@ -277,6 +285,7 @@ export function ConversationPage() {
                     name={data.customer?.name}
                     closed={closed}
                   />
+                  <DispatcherComposer conversationId={data.conversation.id} closed={closed} />
                 </MessageScrollerContent>
               </MessageScrollerViewport>
               <MessageScrollerButton />
@@ -365,6 +374,25 @@ function MessageBubble({ message, sentBy }: { message: Message; sentBy?: Action 
       </MessageRow>
     )
   }
+  // A dispatcher's own reply to the customer — a first-class human message, not
+  // an agent send. It wears a plain human stamp and carries no agent provenance.
+  if (message.author === 'dispatcher') {
+    return (
+      <MessageRow align="end">
+        <MessageContent>
+          <Bubble variant="default" align="end">
+            <BubbleContent className="p-0">
+              <DispatcherStamp />
+              <div className="px-3 py-2 whitespace-pre-wrap">{message.body}</div>
+            </BubbleContent>
+          </Bubble>
+          <MessageFooter>
+            <TimeAgo at={message.created_at} />
+          </MessageFooter>
+        </MessageContent>
+      </MessageRow>
+    )
+  }
   const original =
     sentBy?.decision?.kind === 'approve_with_edits' ? messageText(sentBy.input) : null
   return (
@@ -412,6 +440,17 @@ function OriginalDraft({ text }: { text: string }) {
         </div>
       </CollapsibleContent>
     </Collapsible>
+  )
+}
+
+// The stamp at the top of a dispatcher's own reply: a human sent this straight
+// to the customer, no agent involved.
+function DispatcherStamp() {
+  return (
+    <div className="flex items-center gap-1.5 border-b border-primary-foreground/15 bg-primary-foreground/10 px-3 py-1 font-mono text-[10px] tracking-widest text-primary-foreground/80 uppercase [&_svg]:size-3 [&_svg]:shrink-0">
+      <UserIcon />
+      <span>Dispatcher</span>
+    </div>
   )
 }
 

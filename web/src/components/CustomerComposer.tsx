@@ -9,10 +9,10 @@ import { Textarea } from '@/components/ui/textarea'
 // CustomerComposer is the dev's way to speak as the customer. It lives on the
 // customer's side of the thread (left), right under the latest message: a
 // collapsed affordance you click to reveal an inline text box, so a simulated
-// customer message appears exactly where a real one would. The foot of the
-// thread is deliberately left free for a future dispatcher manual-reply
-// composer. Sending hits the same inbound path a real WhatsApp webhook would —
-// nothing downstream knows the difference.
+// customer message appears exactly where a real one would. The dispatcher's own
+// reply composer (DispatcherComposer) sits just below it, on the outbound side.
+// Sending hits the same inbound path a real WhatsApp webhook would — nothing
+// downstream knows the difference.
 export function CustomerComposer({
   phone,
   name,

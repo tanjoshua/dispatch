@@ -13,4 +13,12 @@ const (
 	// dispatcher's decision does. Payload: {conversation_id, acknowledged_by,
 	// note}. See design/001-escalation.md §4.
 	EventEscalationAcknowledged agentkit.EventType = "escalation_acknowledged"
+
+	// EventDispatcherMessage records the dispatcher sending a message directly
+	// to the customer (design/003-dispatcher-as-participant.md). Like an
+	// acknowledgement it is a human act with no backing agent Action, so it is
+	// its own event on the run's log. The outbound message row is the projection
+	// the UI reads; this event is the audit entry. Payload: {conversation_id,
+	// message_id, sent_by}.
+	EventDispatcherMessage agentkit.EventType = "dispatcher_message"
 )
