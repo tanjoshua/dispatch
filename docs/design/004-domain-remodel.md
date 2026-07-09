@@ -271,7 +271,7 @@ The full multi‑pack mechanics (how a second pack registers its lifecycle, how
 `Data` schemas are declared, how policy config is shaped) are **not fully
 specified here** — deliberately. With one pack, any such API is a guess (same
 reasoning as `000`'s agentkit‑extraction trigger). This doc gives Playbook its
-*place and role*; the pack SDK is `005` once the field‑service pack is real and a
+*place and role*; the pack SDK is `006` once the field‑service pack is real and a
 second vertical presses on its shape.
 
 ## 9. Where post‑intake work finally lives
@@ -407,7 +407,7 @@ The four decompositions are interdependent but land in a safe order:
   **Deferred to Phase 5 (the pack SDK):** `update_case`'s input schema / prompts /
   policy driven by playbook `config` (the store's `data` merge is already
   schema‑agnostic, so no store change is owed); a config‑authored tool catalog.
-- **Phase 5 (own doc, 005) — Pack SDK + second vertical.** Only when a second
+- **Phase 5 (own doc, 006) — Pack SDK + second vertical.** Only when a second
   vertical is real. Also unlocks the first post‑intake task‑run (scheduling),
   which validates §6/§9.
 
@@ -434,4 +434,4 @@ the critical path to the omnichannel inbox the product needs first.
   direction holds past a second pack, the name will strain. Noted, not acted on.
 - **Pack lifecycle declaration.** How a pack declares its case states and
   transitions (code enum? a small declarative table the code owns?) is the
-  central `005` question and intentionally unanswered here.
+  central `006` question and intentionally unanswered here.

@@ -3,8 +3,8 @@
 Tracks what is built against `docs/design/000-foundation.md`. Update this
 when a milestone lands or scope changes.
 
-_Last updated: 2026-07-05 — v1 WhatsApp intake demo implemented and verified
-end-to-end._
+_Last updated: 2026-07-09 — domain remodel (design 004) landed through Phase 4;
+context hydration designed (design 005)._
 
 ## Completed (v1 intake demo)
 
@@ -131,10 +131,11 @@ end-to-end._
         reuses the thread's live run or starts a fresh task-run + binding.
         Verified live (fake LLM + Temporal): inbound → run+binding+case created,
         `data` bag populated, a running run is reused (no dup), one
-        customer/identity. **Deferred (own follow-ups):** context hydration (a new
-        run still starts without prior thread history — needs transcript assembly
-        + fake-LLM turn-count handling); a dedicated unified customer-profile UI
-        (the inbox lists threads today, each resolving to one customer).
+        customer/identity. **Deferred (own follow-ups):** context hydration — a new
+        run still starts without prior thread history — now designed in
+        `design/005-thread-context-hydration.md` (tiered briefing; not yet built);
+        a dedicated unified customer-profile UI (the inbox lists threads today,
+        each resolving to one customer).
   - [x] **Phase 4 — Playbook substrate.** Migration `0008`: `playbooks` table
         (selects the code agent/pack + names the case type it produces), seeded
         `pb_field_service` (agent `intake`, case type `field_service_job`).
@@ -144,8 +145,16 @@ end-to-end._
         this is the *selection* seam the horizontal story hangs on. Verified: build/
         vet/test, migration applied + `chan_dev` bound + all bindings backfilled;
         Router playbook resolution + case_type derivation checked live.
-        **Deferred to Phase 5 (own doc):** config‑parameterized `update_case`
+        **Deferred to Phase 5 (own doc, `006`):** config‑parameterized `update_case`
         InputSchema / prompts / policy (the pack SDK) + a second vertical.
+- [ ] **Thread context hydration (`design/005-thread-context-hydration.md`, proposed).**
+      A returning customer's new run starts cold. Fix with a tiered, bounded
+      *briefing* (customer profile + rolling thread summary + recent-message
+      window), carried as per-run system context — not a replayed transcript.
+      Minimal slice (5a): profile-lite + recent window via a new
+      `AgentLoopInput.SystemContext` seam; summary (5b) and semantic recall (5c)
+      follow. Dissolves the fake-LLM turn-count blocker (briefing adds no user
+      turns). Not yet built.
 - [ ] Live call through the Anthropic adapter (no API key in the dev
       environment; adapter compiles against the current SDK but is unexercised)
 - [ ] Automated tests (e2e was exercised manually via the API; no `_test.go`
