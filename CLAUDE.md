@@ -4,9 +4,10 @@ AI agents do dispatch work (starting with WhatsApp job intake); humans review
 agent actions like a developer reviews a coding agent — approve / edit /
 reject — with a policy layer that slides toward full autonomy over time.
 
-**Read `docs/design/000-foundation.md` before making architectural changes.**
-New features that need design thought get their own numbered doc in
-`docs/design/`.
+**Read `docs/OVERVIEW.md` before making architectural changes.** It is the
+single living doc: current implementation + the prioritized gap list. Update
+it when the implementation or priorities change. (The old numbered design
+docs it consolidated live in git history.)
 
 ## Stack
 
