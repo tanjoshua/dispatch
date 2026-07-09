@@ -17,6 +17,15 @@ import (
 // AgentLoopWorkflowName is the registered workflow type name.
 const AgentLoopWorkflowName = "AgentLoop"
 
+// MaxLLMCallsPerTurn caps completions within one agent turn. Auto-approved
+// tools put no human in the loop, so without a budget the propose→execute
+// cycle can spin unbounded (cost, and an agent acting far past its brief).
+// Hitting the cap stops the turn, records turn_budget_exceeded, and lets the
+// application summon a human via the Activities hook; the agent resumes on
+// the customer's next message. Per-agent configuration graduates onto
+// AgentDefinition when an agent needs a different ceiling.
+const MaxLLMCallsPerTurn = 10
+
 // Register wires the agent loop workflow and its activities into a worker.
 func Register(w worker.Worker, acts *Activities) {
 	w.RegisterWorkflowWithOptions(AgentLoopWorkflow, workflow.RegisterOptions{Name: AgentLoopWorkflowName})
@@ -46,6 +55,7 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 	})
 
 	log := newMessageLog(input)
+	llmCalls := input.LLMCalls
 	inboundCh := workflow.GetSignalChannel(ctx, SignalInboundMessage)
 	decisionCh := workflow.GetSignalChannel(ctx, SignalDecision)
 	dispatcherCh := workflow.GetSignalChannel(ctx, SignalDispatcherMessage)
@@ -58,7 +68,7 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 		// who is handling the conversation (design/003-dispatcher-as-participant.md).
 		sawCustomer := awaitContext(ctx, inboundCh, dispatcherCh, log)
 		if sawCustomer {
-			terminal, err := agentTurn(llmCtx, actCtx, decisionCh, dispatcherCh, input, log)
+			terminal, err := agentTurn(llmCtx, actCtx, decisionCh, dispatcherCh, input, log, &llmCalls)
 			if err != nil {
 				finishRun(actCtx, input, agentkit.RunFailed, logger)
 				return err
@@ -74,6 +84,7 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 			next := input
 			next.Messages = log.messages
 			next.ProcessedMessageIDs = log.seenIDs
+			next.LLMCalls = llmCalls
 			return workflow.NewContinueAsNewError(ctx, AgentLoopWorkflowName, next)
 		}
 	}
@@ -176,15 +187,38 @@ func finishRun(actCtx workflow.Context, input AgentLoopInput, status agentkit.Ru
 	return err
 }
 
-// agentTurn runs LLM completions until the agent stops proposing tool calls
-// or a terminal tool executes successfully.
-func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog) (terminal bool, err error) {
+// agentTurn runs LLM completions until the agent stops proposing tool calls,
+// a terminal tool executes successfully, or the turn's LLM budget runs out.
+func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog, llmCalls *int) (terminal bool, err error) {
 	logger := workflow.GetLogger(llmCtx)
 
+	turnCalls := 0
 	for {
+		if turnCalls >= MaxLLMCallsPerTurn {
+			// Safety rail: stop the turn, record it, let the app summon a
+			// human. The last context entry is this turn's tool results, a
+			// valid resting point; the next customer message resumes the agent.
+			err := workflow.ExecuteActivity(actCtx, "RecordTurnBudgetExceeded", TurnBudgetExceededInput{
+				RunID: input.RunID,
+				OrgID: input.OrgID,
+				Agent: input.Agent,
+				Seq:   *llmCalls,
+				Calls: turnCalls,
+			}).Get(actCtx, nil)
+			if err != nil {
+				return false, fmt.Errorf("record turn budget exceeded: %w", err)
+			}
+			return false, nil
+		}
+		turnCalls++
+		*llmCalls++
+
 		var resp llm.CompletionResponse
 		err := workflow.ExecuteActivity(llmCtx, "Complete", CompleteInput{
+			RunID:    input.RunID,
+			OrgID:    input.OrgID,
 			Agent:    input.Agent,
+			Seq:      *llmCalls,
 			Messages: log.messages,
 		}).Get(llmCtx, &resp)
 		if err != nil {

@@ -84,6 +84,11 @@ type AgentLoopInput struct {
 	// ID — each external message drives at most one turn. Append-ordered
 	// (deterministic under replay); carried across ContinueAsNew like Messages.
 	ProcessedMessageIDs []string `json:"processed_message_ids,omitempty"`
+
+	// LLMCalls counts completions across the run's life (survives
+	// ContinueAsNew). It keys llm_completed usage events idempotently under
+	// activity retries.
+	LLMCalls int `json:"llm_calls,omitempty"`
 }
 
 // InboundMessage is the inbound_message signal payload. Channel adapters

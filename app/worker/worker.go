@@ -3,6 +3,8 @@
 package worker
 
 import (
+	"context"
+
 	"github.com/jackc/pgx/v5/pgxpool"
 	temporalclient "go.temporal.io/sdk/client"
 	"go.temporal.io/sdk/worker"
@@ -28,6 +30,17 @@ func New(tc temporalclient.Client, pool *pgxpool.Pool, model string, llmClient l
 		Store: store.NewPostgres(pool),
 		Agents: map[string]temporalkit.AgentDefinition{
 			def.Name: def,
+		},
+		// A tripped turn budget means the agent was acting without a human in
+		// the path; flag the conversation so a dispatcher engages (the same
+		// attention projection the escalate tool uses).
+		TurnBudgetExceeded: func(ctx context.Context, runID, orgID string) error {
+			conv, err := appStore.GetConversationByRunID(ctx, runID)
+			if err != nil {
+				return err
+			}
+			return appStore.RaiseEscalation(ctx, conv.ID,
+				"Agent paused: it hit the per-turn LLM call budget. Review the conversation and reply to resume.")
 		},
 	}
 

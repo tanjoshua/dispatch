@@ -16,6 +16,14 @@ const (
 	EventActionFailed    EventType = "action_failed"
 	EventRunCompleted    EventType = "run_completed"
 	EventRunFailed       EventType = "run_failed"
+	// EventLLMCompleted records one LLM completion's usage (model, tokens,
+	// stop reason) — the cost/billing/eval substrate. Appended by the Complete
+	// activity, keyed on the run's completion sequence number.
+	EventLLMCompleted EventType = "llm_completed"
+	// EventTurnBudgetExceeded records that an agent turn hit its LLM-call
+	// budget and was stopped; the application reacts (e.g. summons a human)
+	// via the hook on temporalkit.Activities.
+	EventTurnBudgetExceeded EventType = "turn_budget_exceeded"
 )
 
 // Event is one entry in a run's append-only log — the audit trail, the

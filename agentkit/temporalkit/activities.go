@@ -17,6 +17,12 @@ type Activities struct {
 	LLM    llm.LLM
 	Store  store.Store
 	Agents map[string]AgentDefinition
+
+	// TurnBudgetExceeded, when non-nil, is invoked after a turn_budget_exceeded
+	// event is recorded, so the application can summon a human (flag the
+	// conversation, page someone). agentkit stays domain-blind — reacting to a
+	// tripped safety rail is the app's business.
+	TurnBudgetExceeded func(ctx context.Context, runID, orgID string) error
 }
 
 func (a *Activities) agent(name string) (AgentDefinition, error) {
@@ -27,9 +33,15 @@ func (a *Activities) agent(name string) (AgentDefinition, error) {
 	return def, nil
 }
 
-// CompleteInput asks the LLM for the agent's next turn.
+// CompleteInput asks the LLM for the agent's next turn. Seq is the 1-based
+// index of this completion within the run (deterministic in the workflow,
+// survives ContinueAsNew); it keys the usage event idempotently, so a retried
+// activity never double-counts.
 type CompleteInput struct {
+	RunID    string        `json:"run_id"`
+	OrgID    string        `json:"org_id"`
 	Agent    string        `json:"agent"`
+	Seq      int           `json:"seq"`
 	Messages []llm.Message `json:"messages"`
 }
 
@@ -38,13 +50,56 @@ func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*llm.Compl
 	if err != nil {
 		return nil, err
 	}
-	return a.LLM.Complete(ctx, llm.CompletionRequest{
+	resp, err := a.LLM.Complete(ctx, llm.CompletionRequest{
 		Model:     def.Model,
 		System:    def.System,
 		Messages:  in.Messages,
 		Tools:     def.toolDefs(),
 		MaxTokens: def.MaxTokens,
 	})
+	if err != nil {
+		return nil, err
+	}
+	// Usage lands in the event log as it happens — it is the billing/eval/cost
+	// substrate and cannot be backfilled. A failed append fails the activity;
+	// the retry may spend another LLM call, but the log stays complete.
+	if err := a.Store.AppendEvent(ctx, event(in.OrgID, in.RunID,
+		agentkit.EventLLMCompleted, fmt.Sprintf("llm_completed:%d", in.Seq),
+		map[string]any{
+			"model":         def.Model,
+			"input_tokens":  resp.Usage.InputTokens,
+			"output_tokens": resp.Usage.OutputTokens,
+			"stop_reason":   resp.StopReason,
+			"seq":           in.Seq,
+		})); err != nil {
+		return nil, err
+	}
+	return resp, nil
+}
+
+// TurnBudgetExceededInput records that a turn hit MaxLLMCallsPerTurn. Seq is
+// the run's completion counter at the stop (the idempotency key).
+type TurnBudgetExceededInput struct {
+	RunID string `json:"run_id"`
+	OrgID string `json:"org_id"`
+	Agent string `json:"agent"`
+	Seq   int    `json:"seq"`
+	Calls int    `json:"calls"`
+}
+
+// RecordTurnBudgetExceeded appends the safety-rail event and gives the
+// application its hook to summon a human. The turn has already been stopped by
+// the workflow; this only records and reacts.
+func (a *Activities) RecordTurnBudgetExceeded(ctx context.Context, in TurnBudgetExceededInput) error {
+	if err := a.Store.AppendEvent(ctx, event(in.OrgID, in.RunID,
+		agentkit.EventTurnBudgetExceeded, fmt.Sprintf("turn_budget_exceeded:%d", in.Seq),
+		map[string]any{"agent": in.Agent, "calls": in.Calls, "seq": in.Seq})); err != nil {
+		return err
+	}
+	if a.TurnBudgetExceeded != nil {
+		return a.TurnBudgetExceeded(ctx, in.RunID, in.OrgID)
+	}
+	return nil
 }
 
 // ProposeActionInput records one proposed tool call and runs it through the
