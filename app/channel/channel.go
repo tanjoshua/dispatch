@@ -39,6 +39,12 @@ type OutboundMessage struct {
 	// ID optionally pins the persisted message's ID so the caller can reference
 	// it (e.g. the dispatcher-reply endpoint needs it for the event + signal).
 	// Empty means the adapter assigns one.
+	//
+	// It is also the delivery idempotency key: callers that may retry a send
+	// (the action pipeline derives it from the action ID) pass the same ID each
+	// attempt, and adapters must dedupe on it — persistence via AddMessage
+	// already does; a real transport passes it to its provider as the
+	// idempotency key — so the customer receives the message at most once.
 	ID string `json:"id,omitempty"`
 }
 

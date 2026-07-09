@@ -163,7 +163,7 @@ func (a *Activities) ExecuteAction(ctx context.Context, in ExecuteActionInput) (
 	}
 
 	// The one place a tool ever executes: inside the action pipeline.
-	execCtx := agentkit.WithRunContext(ctx, agentkit.RunContext{RunID: action.RunID, OrgID: action.OrgID})
+	execCtx := agentkit.WithRunContext(ctx, agentkit.RunContext{RunID: action.RunID, OrgID: action.OrgID, ActionID: action.ID})
 	result, execErr := tool.Execute(execCtx, action.EffectiveInput())
 
 	eventType := agentkit.EventActionExecuted

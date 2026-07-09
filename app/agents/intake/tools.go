@@ -64,11 +64,22 @@ func (t *sendMessageTool) Execute(ctx context.Context, input json.RawMessage) (j
 	if in.Message == "" {
 		return nil, fmt.Errorf("send_message: message is empty")
 	}
-	conv, err := conversationFor(ctx, t.store)
+	rc, ok := agentkit.RunContextFrom(ctx)
+	if !ok {
+		return nil, fmt.Errorf("send_message: no run context (tool executed outside the action pipeline?)")
+	}
+	conv, err := t.store.GetConversationByRunID(ctx, rc.RunID)
 	if err != nil {
 		return nil, err
 	}
-	if err := t.sender.Send(ctx, conv.ID, channel.OutboundMessage{Body: in.Message, Author: domain.AuthorAgent}); err != nil {
+	// The message ID is the action ID: a retried execution (crash between the
+	// send and FinishAction) re-delivers under the same ID, which persistence
+	// and real providers dedupe on — the customer never gets it twice.
+	if err := t.sender.Send(ctx, conv.ID, channel.OutboundMessage{
+		Body:   in.Message,
+		Author: domain.AuthorAgent,
+		ID:     rc.ActionID,
+	}); err != nil {
 		return nil, fmt.Errorf("send_message: %w", err)
 	}
 	return json.RawMessage(`{"status":"sent"}`), nil

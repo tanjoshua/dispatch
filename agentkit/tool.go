@@ -37,12 +37,18 @@ func NewToolSet(tools ...Tool) ToolSet {
 // runContextKey carries RunContext through Execute's ctx.
 type runContextKey struct{}
 
-// RunContext identifies the run on whose behalf a tool executes. The action
-// pipeline injects it; tools that need to know their run (e.g. to look up
-// domain state tied to it) extract it with RunContextFrom.
+// RunContext identifies the run and action on whose behalf a tool executes.
+// The action pipeline injects it; tools that need to know their run (e.g. to
+// look up domain state tied to it) extract it with RunContextFrom.
+//
+// ActionID doubles as the idempotency root for external effects: an activity
+// retry re-executes the tool under the same action, so a tool that derives
+// its external effect's ID from ActionID (e.g. an outbound message ID, passed
+// to the provider as an idempotency key) delivers at most once.
 type RunContext struct {
-	RunID string
-	OrgID string
+	RunID    string
+	OrgID    string
+	ActionID string
 }
 
 // WithRunContext returns ctx carrying rc.
