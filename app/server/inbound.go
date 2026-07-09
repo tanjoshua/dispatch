@@ -13,6 +13,9 @@ type devInboundRequest struct {
 	Phone string `json:"phone"`
 	Name  string `json:"name"`
 	Text  string `json:"text"`
+	// ProviderMessageID optionally simulates a transport message ID so the
+	// inbound dedupe path (webhook retries) can be exercised on the dev channel.
+	ProviderMessageID string `json:"provider_message_id,omitempty"`
 }
 
 // handleDevInbound is the dev channel's inbound transport edge. It resolves the
@@ -46,9 +49,10 @@ func (s *Server) handleDevInbound(w http.ResponseWriter, r *http.Request) {
 	}
 
 	res, err := s.Router.Receive(ctx, *conn, channel.InboundMessage{
-		From: req.Phone,
-		Name: strings.TrimSpace(req.Name),
-		Text: req.Text,
+		From:              req.Phone,
+		Name:              strings.TrimSpace(req.Name),
+		Text:              req.Text,
+		ProviderMessageID: strings.TrimSpace(req.ProviderMessageID),
 	})
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

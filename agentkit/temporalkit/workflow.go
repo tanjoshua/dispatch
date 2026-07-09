@@ -45,7 +45,7 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 		RetryPolicy:         &temporal.RetryPolicy{InitialInterval: time.Second, MaximumAttempts: 5},
 	})
 
-	messages := input.Messages
+	log := newMessageLog(input)
 	inboundCh := workflow.GetSignalChannel(ctx, SignalInboundMessage)
 	decisionCh := workflow.GetSignalChannel(ctx, SignalDecision)
 	dispatcherCh := workflow.GetSignalChannel(ctx, SignalDispatcherMessage)
@@ -56,9 +56,9 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 		// the agent runs a turn only when the *customer* spoke — a dispatcher
 		// message informs the agent without provoking it to talk over a human
 		// who is handling the conversation (design/003-dispatcher-as-participant.md).
-		sawCustomer := awaitContext(ctx, inboundCh, dispatcherCh, &messages)
+		sawCustomer := awaitContext(ctx, inboundCh, dispatcherCh, log)
 		if sawCustomer {
-			terminal, err := agentTurn(llmCtx, actCtx, decisionCh, dispatcherCh, input, &messages)
+			terminal, err := agentTurn(llmCtx, actCtx, decisionCh, dispatcherCh, input, log)
 			if err != nil {
 				finishRun(actCtx, input, agentkit.RunFailed, logger)
 				return err
@@ -72,30 +72,78 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 		// Conversation context is carried in the new input.
 		if workflow.GetInfo(ctx).GetContinueAsNewSuggested() && inboundCh.Len() == 0 && dispatcherCh.Len() == 0 {
 			next := input
-			next.Messages = messages
+			next.Messages = log.messages
+			next.ProcessedMessageIDs = log.seenIDs
 			return workflow.NewContinueAsNewError(ctx, AgentLoopWorkflowName, next)
 		}
 	}
 }
 
+// messageLog is the workflow-side conversation context plus the IDs of external
+// messages already absorbed into it. Channel adapters re-signal on duplicate
+// transport deliveries (webhook retries), and a client may retry the dispatcher
+// reply endpoint — so absorption is keyed on message ID, and each external
+// message informs the agent exactly once.
+type messageLog struct {
+	messages []llm.Message
+	seenIDs  []string        // append-ordered, deterministic under replay
+	seen     map[string]bool // same contents, for lookup
+}
+
+func newMessageLog(input AgentLoopInput) *messageLog {
+	l := &messageLog{
+		messages: input.Messages,
+		seenIDs:  input.ProcessedMessageIDs,
+		seen:     make(map[string]bool, len(input.ProcessedMessageIDs)),
+	}
+	for _, id := range input.ProcessedMessageIDs {
+		l.seen[id] = true
+	}
+	return l
+}
+
+// mark records an external message ID, reporting false when it was already
+// absorbed (a redelivered signal). Messages without an ID are never deduped.
+func (l *messageLog) mark(id string) bool {
+	if id == "" {
+		return true
+	}
+	if l.seen[id] {
+		return false
+	}
+	l.seen[id] = true
+	l.seenIDs = append(l.seenIDs, id)
+	return true
+}
+
 // awaitContext blocks until at least one inbound or dispatcher message is
 // available, then drains all buffered messages of both kinds into the shared
-// context. It reports whether any *customer* (inbound) message arrived — the
-// trigger for an agent turn. A dispatcher message updates context without
-// provoking a turn.
-func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh workflow.ReceiveChannel, messages *[]llm.Message) bool {
+// context (skipping redelivered ones). It reports whether any *new* customer
+// (inbound) message arrived — the trigger for an agent turn. A dispatcher
+// message updates context without provoking a turn.
+func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh workflow.ReceiveChannel, log *messageLog) bool {
 	sawCustomer := false
+	absorbInbound := func(m InboundMessage) {
+		if log.mark(m.MessageID) {
+			log.messages = append(log.messages, llm.UserText(m.Text))
+			sawCustomer = true
+		}
+	}
+	absorbDispatcher := func(m DispatcherMessageSignal) {
+		if log.mark(m.MessageID) {
+			log.messages = append(log.messages, DispatcherContextMessage(m.Text))
+		}
+	}
 	sel := workflow.NewSelector(ctx)
 	sel.AddReceive(inboundCh, func(c workflow.ReceiveChannel, _ bool) {
 		var m InboundMessage
 		c.Receive(ctx, &m)
-		*messages = append(*messages, llm.UserText(m.Text))
-		sawCustomer = true
+		absorbInbound(m)
 	})
 	sel.AddReceive(dispatcherCh, func(c workflow.ReceiveChannel, _ bool) {
 		var m DispatcherMessageSignal
 		c.Receive(ctx, &m)
-		*messages = append(*messages, DispatcherContextMessage(m.Text))
+		absorbDispatcher(m)
 	})
 	sel.Select(ctx) // block for the first
 	// Drain the rest without blocking, checking both kinds each pass so a
@@ -103,13 +151,12 @@ func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh workflow.Receive
 	for {
 		var in InboundMessage
 		if inboundCh.ReceiveAsync(&in) {
-			*messages = append(*messages, llm.UserText(in.Text))
-			sawCustomer = true
+			absorbInbound(in)
 			continue
 		}
 		var dm DispatcherMessageSignal
 		if dispatcherCh.ReceiveAsync(&dm) {
-			*messages = append(*messages, DispatcherContextMessage(dm.Text))
+			absorbDispatcher(dm)
 			continue
 		}
 		break
@@ -131,14 +178,14 @@ func finishRun(actCtx workflow.Context, input AgentLoopInput, status agentkit.Ru
 
 // agentTurn runs LLM completions until the agent stops proposing tool calls
 // or a terminal tool executes successfully.
-func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, messages *[]llm.Message) (terminal bool, err error) {
+func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog) (terminal bool, err error) {
 	logger := workflow.GetLogger(llmCtx)
 
 	for {
 		var resp llm.CompletionResponse
 		err := workflow.ExecuteActivity(llmCtx, "Complete", CompleteInput{
 			Agent:    input.Agent,
-			Messages: *messages,
+			Messages: log.messages,
 		}).Get(llmCtx, &resp)
 		if err != nil {
 			return false, fmt.Errorf("llm completion: %w", err)
@@ -147,7 +194,7 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflo
 			logger.Warn("empty completion", "stop_reason", resp.StopReason)
 			return false, nil
 		}
-		*messages = append(*messages, llm.AssistantMessage(&resp))
+		log.messages = append(log.messages, llm.AssistantMessage(&resp))
 
 		calls := resp.ToolCalls()
 		if len(calls) == 0 {
@@ -158,7 +205,7 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflo
 		var notes []string // dispatcher messages that arrived mid-turn
 		standDown := false // a draft was dismissed or superseded: end the turn
 		for _, call := range calls {
-			outcome, note, err := decideAndExecute(actCtx, decisionCh, dispatcherCh, input, call)
+			outcome, note, err := decideAndExecute(actCtx, decisionCh, dispatcherCh, input, log, call)
 			if err != nil {
 				return false, err
 			}
@@ -176,7 +223,7 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflo
 		// All results for one assistant turn go back in a single user message;
 		// any dispatcher messages that arrived during the turn ride along in
 		// that same turn, keeping conversation roles alternating.
-		*messages = append(*messages, toolResultsWithNotes(results, notes))
+		log.messages = append(log.messages, toolResultsWithNotes(results, notes))
 		if terminal {
 			return true, nil
 		}
@@ -217,7 +264,7 @@ func toolResultsWithNotes(results []llm.ToolResult, notes []string) llm.Message 
 // proposed action waits for a human decision, a dispatcher message may arrive
 // instead — the human answered the customer directly — which supersedes the
 // pending action and returns the dispatcher's text as a context note.
-func decideAndExecute(actCtx workflow.Context, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, call llm.ToolCall) (*ExecuteActionResult, string, error) {
+func decideAndExecute(actCtx workflow.Context, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog, call llm.ToolCall) (*ExecuteActionResult, string, error) {
 	logger := workflow.GetLogger(actCtx)
 
 	var action agentkit.Action
@@ -253,6 +300,9 @@ func decideAndExecute(actCtx workflow.Context, decisionCh, dispatcherCh workflow
 		sel.Select(actCtx)
 
 		if disp != nil {
+			if !log.mark(disp.MessageID) {
+				continue // redelivered signal; its first delivery already acted
+			}
 			// The dispatcher answered directly. Withdraw this draft as
 			// superseded and carry their message into context. The message is
 			// already delivered + persisted by the reply endpoint; here we only

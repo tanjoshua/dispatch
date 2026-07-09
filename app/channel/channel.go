@@ -54,6 +54,12 @@ type InboundMessage struct {
 	From string `json:"from"`
 	Name string `json:"name"`
 	Text string `json:"text"`
+	// ProviderMessageID is the transport's own ID for the message (a WhatsApp
+	// wamid, etc.) — the inbound dedupe key. Providers retry webhooks and can
+	// deliver duplicates; Receive treats a message whose provider ID was already
+	// stored as a redelivery of the original. Empty (the dev pane) disables
+	// dedupe for that message.
+	ProviderMessageID string `json:"provider_message_id,omitempty"`
 }
 
 // RouteResult reports what an inbound message resolved to.
@@ -160,6 +166,25 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 		return RouteResult{}, err
 	}
 
+	// Persist the message before touching the run: the stored row, deduped on
+	// the provider's message ID, is the idempotency anchor for the whole inbound
+	// path. A redelivery (webhook retry, provider duplicate) resolves to the
+	// original row and re-signals with its canonical ID; the workflow dedupes
+	// signals by message ID, so the agent sees each message exactly once no
+	// matter how many times the transport delivers it.
+	msg, _, err := r.store.AddInboundMessage(ctx, domain.Message{
+		ID:                agentkit.NewID(),
+		OrgID:             conn.OrgID,
+		ConversationID:    conv.ID,
+		Direction:         domain.Inbound,
+		Author:            domain.AuthorCustomer,
+		Body:              in.Text,
+		ProviderMessageID: in.ProviderMessageID,
+	})
+	if err != nil {
+		return RouteResult{}, err
+	}
+
 	// The connection routes inbound to a playbook, which selects the agent (pack)
 	// that runs and the case type it produces (design/004 §8). Fall back to the
 	// Router's default agent when a connection has no playbook.
@@ -179,17 +204,6 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 		return RouteResult{}, err
 	}
 
-	msg := domain.Message{
-		ID:             agentkit.NewID(),
-		OrgID:          conn.OrgID,
-		ConversationID: conv.ID,
-		Direction:      domain.Inbound,
-		Author:         domain.AuthorCustomer,
-		Body:           in.Text,
-	}
-	if err := r.store.AddMessage(ctx, msg); err != nil {
-		return RouteResult{}, err
-	}
 	payload, _ := json.Marshal(map[string]string{"message_id": msg.ID, "conversation_id": conv.ID})
 	if err := r.agentkit.AppendEvent(ctx, agentkit.Event{
 		ID:        agentkit.NewID(),
@@ -205,7 +219,7 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 	_, err = r.temporal.SignalWithStartWorkflow(ctx,
 		agentkit.WorkflowID(runID),
 		temporalkit.SignalInboundMessage,
-		temporalkit.InboundMessage{MessageID: msg.ID, Text: in.Text},
+		temporalkit.InboundMessage{MessageID: msg.ID, Text: msg.Body},
 		temporalclient.StartWorkflowOptions{
 			ID:        agentkit.WorkflowID(runID),
 			TaskQueue: r.taskQueue,
@@ -224,8 +238,10 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 // creating a fresh task-run (and its binding) when the thread has none or its
 // last run already finished. A finished run means the previous case is done; the
 // new run will open a new case on the same persistent thread
-// (design/004-domain-remodel.md §6).
+// (design/004-domain-remodel.md §6). Concurrency-safe: the binding is claimed
+// under a conversation-row lock, so two racing deliveries converge on one run.
 func (r *Router) ensureRun(ctx context.Context, orgID string, conv *domain.Conversation, agentName, playbookID string) (string, error) {
+	// Fast path, no locks: the common case is a live run already bound.
 	latest, err := r.store.LatestRunIDForConversation(ctx, conv.ID)
 	if err != nil {
 		return "", err
@@ -239,17 +255,35 @@ func (r *Router) ensureRun(ctx context.Context, orgID string, conv *domain.Conve
 			return run.ID, nil
 		}
 	}
-	runID := agentkit.NewID()
+
+	// Create a candidate run, then claim the thread's live-run slot for it. A
+	// concurrent delivery may have claimed first — then its run wins and our
+	// unbound candidate is retired.
+	candidate := agentkit.NewID()
 	if err := r.agentkit.CreateRun(ctx, agentkit.Run{
-		ID:     runID,
+		ID:     candidate,
 		OrgID:  orgID,
 		Agent:  agentName,
 		Status: agentkit.RunRunning,
 	}); err != nil {
 		return "", err
 	}
-	if err := r.store.CreateRunBinding(ctx, runID, orgID, conv.ID, "intake", playbookID); err != nil {
+	winner, err := r.store.ClaimRunBinding(ctx, orgID, conv.ID, candidate, "intake", playbookID)
+	if err != nil {
 		return "", err
 	}
-	return runID, nil
+	if winner != candidate {
+		// Best-effort: an unbound running row is invisible to routing (nothing
+		// binds it); failing to retire it only leaves that.
+		payload, _ := json.Marshal(map[string]string{"reason": "lost live-run claim to a concurrent inbound delivery"})
+		_ = r.agentkit.FinishRun(ctx, candidate, agentkit.RunFailed, agentkit.Event{
+			ID:        agentkit.NewID(),
+			OrgID:     orgID,
+			RunID:     candidate,
+			Type:      agentkit.EventRunFailed,
+			Payload:   payload,
+			DedupeKey: "run_failed:" + candidate,
+		})
+	}
+	return winner, nil
 }

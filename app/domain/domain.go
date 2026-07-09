@@ -135,7 +135,11 @@ type Message struct {
 	Direction      Direction     `json:"direction"`
 	Author         MessageAuthor `json:"author"`
 	Body           string        `json:"body"`
-	CreatedAt      time.Time     `json:"created_at"`
+	// ProviderMessageID is the transport's own ID for an inbound message (a
+	// WhatsApp wamid, etc.) — the dedupe key under webhook retries and provider
+	// duplicates. Empty on outbound messages and on channels without one (dev).
+	ProviderMessageID string    `json:"provider_message_id,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
 }
 
 type CaseStatus string

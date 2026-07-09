@@ -77,6 +77,13 @@ type AgentLoopInput struct {
 	// Messages carries accumulated conversation context across
 	// ContinueAsNew. Empty on a fresh run.
 	Messages []llm.Message `json:"messages,omitempty"`
+
+	// ProcessedMessageIDs carries the IDs of customer/dispatcher messages
+	// already absorbed into Messages. Channel adapters re-signal on duplicate
+	// deliveries (webhook retries), so the workflow dedupes signals by message
+	// ID — each external message drives at most one turn. Append-ordered
+	// (deterministic under replay); carried across ContinueAsNew like Messages.
+	ProcessedMessageIDs []string `json:"processed_message_ids,omitempty"`
 }
 
 // InboundMessage is the inbound_message signal payload. Channel adapters

@@ -29,48 +29,72 @@ func NewStore(pool *pgxpool.Pool) *Store { return &Store{pool: pool} }
 // time. This is where an inbound message's channel address maps to a CRM
 // customer (design/004-domain-remodel.md §3) — replacing the old phone-keyed
 // customer. A blank existing name is filled if we now have one; an existing
-// name is never overwritten.
+// name is never overwritten. Safe under concurrent first messages: an insert
+// that loses the identity's (org, kind, address) unique race falls back to the
+// winner's row.
 func (s *Store) GetOrCreateCustomerByIdentity(ctx context.Context, orgID, kind, address, name string) (*Customer, error) {
+	for attempt := 0; attempt < 3; attempt++ {
+		var customerID string
+		err := s.pool.QueryRow(ctx, `
+			SELECT customer_id FROM contact_identities
+			WHERE org_id = $1 AND channel_kind = $2 AND address = $3`,
+			orgID, kind, address).Scan(&customerID)
+		switch {
+		case err == nil:
+			if name != "" {
+				if _, err := s.pool.Exec(ctx, `
+					UPDATE customers SET name = $2 WHERE id = $1 AND name = ''`,
+					customerID, name); err != nil {
+					return nil, err
+				}
+			}
+			return s.GetCustomer(ctx, customerID)
+		case !errors.Is(err, pgx.ErrNoRows):
+			return nil, err
+		}
+		created, err := s.tryCreateCustomerWithIdentity(ctx, orgID, kind, address, name)
+		if err != nil {
+			return nil, err
+		}
+		if created != "" {
+			return s.GetCustomer(ctx, created)
+		}
+		// Lost the create race; loop to read the winner's identity.
+	}
+	return nil, fmt.Errorf("domain: could not resolve customer for (%s, %s)", kind, address)
+}
+
+// tryCreateCustomerWithIdentity inserts a customer and its identity in one
+// transaction. Returns "" (rolled back, no error) when a concurrent creator won
+// the identity's unique constraint first.
+func (s *Store) tryCreateCustomerWithIdentity(ctx context.Context, orgID, kind, address, name string) (string, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer tx.Rollback(ctx)
 
-	var customerID string
-	err = tx.QueryRow(ctx, `
-		SELECT customer_id FROM contact_identities
-		WHERE org_id = $1 AND channel_kind = $2 AND address = $3`,
-		orgID, kind, address).Scan(&customerID)
-	switch {
-	case errors.Is(err, pgx.ErrNoRows):
-		customerID = agentkit.NewID()
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO customers (id, org_id, name) VALUES ($1, $2, $3)`,
-			customerID, orgID, name); err != nil {
-			return nil, err
-		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO contact_identities (id, org_id, customer_id, channel_kind, address)
-			VALUES ($1, $2, $3, $4, $5)`,
-			agentkit.NewID(), orgID, customerID, kind, address); err != nil {
-			return nil, err
-		}
-	case err != nil:
-		return nil, err
-	default:
-		if name != "" {
-			if _, err := tx.Exec(ctx, `
-				UPDATE customers SET name = $2 WHERE id = $1 AND name = ''`,
-				customerID, name); err != nil {
-				return nil, err
-			}
-		}
+	customerID := agentkit.NewID()
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO customers (id, org_id, name) VALUES ($1, $2, $3)`,
+		customerID, orgID, name); err != nil {
+		return "", err
+	}
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO contact_identities (id, org_id, customer_id, channel_kind, address)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (org_id, channel_kind, address) DO NOTHING`,
+		agentkit.NewID(), orgID, customerID, kind, address)
+	if err != nil {
+		return "", err
+	}
+	if tag.RowsAffected() == 0 {
+		return "", nil // lost the race; the deferred rollback discards our customer
 	}
 	if err := tx.Commit(ctx); err != nil {
-		return nil, err
+		return "", err
 	}
-	return s.GetCustomer(ctx, customerID)
+	return customerID, nil
 }
 
 func (s *Store) GetCustomer(ctx context.Context, id string) (*Customer, error) {
@@ -193,12 +217,18 @@ func (s *Store) scanConversation(row pgx.Row) (*Conversation, error) {
 }
 
 func (s *Store) CreateConversation(ctx context.Context, orgID, customerID, channelID string) (*Conversation, error) {
+	// One thread per (customer, channel) is a unique constraint; a concurrent
+	// creator winning it means the thread already exists — return it.
 	id := agentkit.NewID()
-	_, err := s.pool.Exec(ctx, `
-		INSERT INTO conversations (id, org_id, customer_id, channel_id) VALUES ($1, $2, $3, $4)`,
+	tag, err := s.pool.Exec(ctx, `
+		INSERT INTO conversations (id, org_id, customer_id, channel_id) VALUES ($1, $2, $3, $4)
+		ON CONFLICT (org_id, customer_id, channel_id) DO NOTHING`,
 		id, orgID, customerID, channelID)
 	if err != nil {
 		return nil, err
+	}
+	if tag.RowsAffected() == 0 {
+		return s.ThreadForCustomerChannel(ctx, orgID, customerID, channelID)
 	}
 	return s.GetConversation(ctx, id)
 }
@@ -227,21 +257,58 @@ func (s *Store) GetConversationByRunID(ctx context.Context, runID string) (*Conv
 
 // --- run bindings ---
 
-// CreateRunBinding records that a run is a task on a conversation, under a
-// playbook. The bound case is set later, when the run's first update_case
-// creates it (design/004-domain-remodel.md §6). playbookID may be empty when a
-// connection has no playbook (the case type then falls back to the default).
-func (s *Store) CreateRunBinding(ctx context.Context, runID, orgID, conversationID, taskKind, playbookID string) error {
+// ClaimRunBinding makes candidateRunID the thread's live run — binding it as a
+// task on the conversation, under a playbook — unless another bound run is
+// still running, and returns the run that won. It locks the conversation row so
+// two concurrent inbound deliveries can't each create a live run on one thread
+// (a thread has at most one run awaiting customer input, design/004 §6); the
+// loser's caller retires its candidate. The bound case is set later, when the
+// run's first update_case creates it. playbookID may be empty when a connection
+// has no playbook (the case type then falls back to the default).
+//
+// Reading runs.status here reaches into agentkit's table from app SQL — the
+// schemas already share one database (run_bindings carries the FK), and a
+// check-then-insert across the two stores is exactly the race this closes.
+func (s *Store) ClaimRunBinding(ctx context.Context, orgID, conversationID, candidateRunID, taskKind, playbookID string) (string, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer tx.Rollback(ctx)
+
+	var locked string
+	if err := tx.QueryRow(ctx, `
+		SELECT id FROM conversations WHERE id = $1 FOR UPDATE`, conversationID).Scan(&locked); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return "", ErrNotFound
+		}
+		return "", err
+	}
+	var live string
+	err = tx.QueryRow(ctx, `
+		SELECT rb.run_id FROM run_bindings rb
+		JOIN runs r ON r.id = rb.run_id
+		WHERE rb.conversation_id = $1 AND r.status = 'running'
+		ORDER BY rb.created_at DESC LIMIT 1`, conversationID).Scan(&live)
+	switch {
+	case err == nil:
+		return live, tx.Commit(ctx)
+	case !errors.Is(err, pgx.ErrNoRows):
+		return "", err
+	}
+
 	var pb *string
 	if playbookID != "" {
 		pb = &playbookID
 	}
-	_, err := s.pool.Exec(ctx, `
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO run_bindings (run_id, org_id, conversation_id, task_kind, playbook_id)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (run_id) DO NOTHING`,
-		runID, orgID, conversationID, taskKind, pb)
-	return err
+		candidateRunID, orgID, conversationID, taskKind, pb); err != nil {
+		return "", err
+	}
+	return candidateRunID, tx.Commit(ctx)
 }
 
 // LatestRunIDForConversation returns the most recent run bound to a thread, or
@@ -318,8 +385,27 @@ func (s *Store) ListConversations(ctx context.Context, orgID string) ([]Conversa
 
 // --- messages ---
 
-// AddMessage inserts a message (idempotent on ID) and bumps the
-// conversation's updated_at.
+const messageSelect = `
+	SELECT id, org_id, conversation_id, direction, author, body,
+	       COALESCE(provider_message_id, ''), created_at
+	FROM messages`
+
+func scanMessage(row pgx.Row) (*Message, error) {
+	var m Message
+	err := row.Scan(&m.ID, &m.OrgID, &m.ConversationID, &m.Direction, &m.Author,
+		&m.Body, &m.ProviderMessageID, &m.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &m, nil
+}
+
+// AddMessage inserts an outbound message (idempotent on ID — the retried-send
+// dedupe) and bumps the conversation's updated_at. Inbound messages go through
+// AddInboundMessage, which dedupes on the provider's message ID instead.
 func (s *Store) AddMessage(ctx context.Context, m Message) error {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
@@ -343,23 +429,70 @@ func (s *Store) AddMessage(ctx context.Context, m Message) error {
 	return tx.Commit(ctx)
 }
 
+// AddInboundMessage inserts an inbound message, deduplicating on the provider's
+// message ID per conversation: a webhook retry or provider duplicate returns
+// the already-stored row instead of inserting a second one (OVERVIEW §6.1 #2).
+// Returns the canonical message and whether this call inserted it.
+func (s *Store) AddInboundMessage(ctx context.Context, m Message) (*Message, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback(ctx)
+	tag, err := tx.Exec(ctx, `
+		INSERT INTO messages (id, org_id, conversation_id, direction, author, body, provider_message_id)
+		VALUES ($1, $2, $3, $4, $5, $6, $7)
+		ON CONFLICT DO NOTHING`,
+		m.ID, m.OrgID, m.ConversationID, m.Direction, m.Author, m.Body, nullIfEmpty(m.ProviderMessageID))
+	if err != nil {
+		return nil, false, err
+	}
+	if tag.RowsAffected() == 0 {
+		// Duplicate delivery: hand back the original so the caller signals the
+		// run with the canonical message ID.
+		if m.ProviderMessageID == "" {
+			msg, err := scanMessage(s.pool.QueryRow(ctx, messageSelect+` WHERE id = $1`, m.ID))
+			return msg, false, err
+		}
+		msg, err := scanMessage(s.pool.QueryRow(ctx,
+			messageSelect+` WHERE conversation_id = $1 AND provider_message_id = $2`,
+			m.ConversationID, m.ProviderMessageID))
+		return msg, false, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE conversations SET updated_at = now() WHERE id = $1`, m.ConversationID); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+	msg, err := scanMessage(s.pool.QueryRow(ctx, messageSelect+` WHERE id = $1`, m.ID))
+	return msg, true, err
+}
+
 func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]Message, error) {
-	rows, err := s.pool.Query(ctx, `
-		SELECT id, org_id, conversation_id, direction, author, body, created_at
-		FROM messages WHERE conversation_id = $1 ORDER BY created_at, id`, conversationID)
+	rows, err := s.pool.Query(ctx,
+		messageSelect+` WHERE conversation_id = $1 ORDER BY created_at, id`, conversationID)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []Message
 	for rows.Next() {
-		var m Message
-		if err := rows.Scan(&m.ID, &m.OrgID, &m.ConversationID, &m.Direction, &m.Author, &m.Body, &m.CreatedAt); err != nil {
+		m, err := scanMessage(rows)
+		if err != nil {
 			return nil, err
 		}
-		out = append(out, m)
+		out = append(out, *m)
 	}
 	return out, rows.Err()
+}
+
+func nullIfEmpty(s string) *string {
+	if s == "" {
+		return nil
+	}
+	return &s
 }
 
 // --- cases ---
