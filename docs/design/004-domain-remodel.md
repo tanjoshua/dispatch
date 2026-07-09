@@ -398,8 +398,15 @@ The four decompositions are interdependent but land in a safe order:
   scripted fake‑LLM's user‑turn counting, which don't belong rushed into the
   structural change. The **unified customer‑profile UI** (grouping a customer's
   threads/cases) is also its own follow‑up; the data model now supports it.
-- **Phase 4 — Playbook substrate.** Playbook table + selection binding;
-  `update_case` schema derived from the playbook; tool catalog. Still one pack.
+- **Phase 4 — Playbook substrate.** ✅ *Done (selection seam).* `playbooks` table
+  (selects the code agent/pack + names the case type it produces), seeded
+  `pb_field_service`. A channel connection carries a `default_playbook_id`; the
+  Router resolves the playbook, runs its agent, and records `run_bindings.playbook_id`
+  so the case type is *derived from the playbook* rather than hardcoded. With one
+  pack this is the real selection binding — the point the horizontal story hangs on.
+  **Deferred to Phase 5 (the pack SDK):** `update_case`'s input schema / prompts /
+  policy driven by playbook `config` (the store's `data` merge is already
+  schema‑agnostic, so no store change is owed); a config‑authored tool catalog.
 - **Phase 5 (own doc, 005) — Pack SDK + second vertical.** Only when a second
   vertical is real. Also unlocks the first post‑intake task‑run (scheduling),
   which validates §6/§9.

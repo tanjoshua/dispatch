@@ -23,12 +23,29 @@ type Organization struct {
 // connection the message arrived on. Kind selects the code-defined adapter;
 // the connection is the data.
 type ChannelConnection struct {
+	ID                string          `json:"id"`
+	OrgID             string          `json:"org_id"`
+	Kind              string          `json:"kind"`    // "dev" | "whatsapp" | ... — selects the adapter
+	Address           string          `json:"address"` // business-side identity inbound is addressed to; inbound lookup key
+	Config            json.RawMessage `json:"config,omitempty"`
+	Status            string          `json:"status"`              // "active" | "disabled"
+	DefaultPlaybookID string          `json:"default_playbook_id"` // the playbook inbound on this connection routes to (design/004 §8)
+	CreatedAt         time.Time       `json:"created_at"`
+}
+
+// Playbook is the org-tailored config a channel connection routes inbound to: it
+// selects the code agent (pack) that runs and names the case type it produces
+// (design/004-domain-remodel.md §8). Variation across orgs/verticals happens by
+// selecting and parameterizing code-defined capabilities here — never a no-code
+// workflow engine. With one pack (field service) this is the selection seam; the
+// pack SDK (config-parameterized prompts/schemas) is design/005.
+type Playbook struct {
 	ID        string          `json:"id"`
 	OrgID     string          `json:"org_id"`
-	Kind      string          `json:"kind"`    // "dev" | "whatsapp" | ... — selects the adapter
-	Address   string          `json:"address"` // business-side identity inbound is addressed to; inbound lookup key
+	Name      string          `json:"name"`
+	Agent     string          `json:"agent"`     // names a code-registered agent definition
+	CaseType  string          `json:"case_type"` // the case type this playbook produces
 	Config    json.RawMessage `json:"config,omitempty"`
-	Status    string          `json:"status"` // "active" | "disabled"
 	CreatedAt time.Time       `json:"created_at"`
 }
 

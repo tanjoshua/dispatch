@@ -124,12 +124,12 @@ func (s *Store) ContactAddressForConversation(ctx context.Context, conversationI
 // --- channel connections ---
 
 const channelConnectionSelect = `
-	SELECT id, org_id, kind, address, config, status, created_at
+	SELECT id, org_id, kind, address, config, status, COALESCE(default_playbook_id, ''), created_at
 	FROM channel_connections`
 
 func (s *Store) scanChannelConnection(row pgx.Row) (*ChannelConnection, error) {
 	var c ChannelConnection
-	err := row.Scan(&c.ID, &c.OrgID, &c.Kind, &c.Address, &c.Config, &c.Status, &c.CreatedAt)
+	err := row.Scan(&c.ID, &c.OrgID, &c.Kind, &c.Address, &c.Config, &c.Status, &c.DefaultPlaybookID, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -137,6 +137,25 @@ func (s *Store) scanChannelConnection(row pgx.Row) (*ChannelConnection, error) {
 		return nil, err
 	}
 	return &c, nil
+}
+
+// --- playbooks ---
+
+// GetPlaybook resolves the playbook a run should use, selected off the channel
+// connection an inbound message arrived on (design/004-domain-remodel.md §8).
+func (s *Store) GetPlaybook(ctx context.Context, id string) (*Playbook, error) {
+	var p Playbook
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, org_id, name, agent, case_type, config, created_at
+		FROM playbooks WHERE id = $1`, id).
+		Scan(&p.ID, &p.OrgID, &p.Name, &p.Agent, &p.CaseType, &p.Config, &p.CreatedAt)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	return &p, nil
 }
 
 // GetChannelConnectionByAddress resolves the connection an inbound message
@@ -208,15 +227,20 @@ func (s *Store) GetConversationByRunID(ctx context.Context, runID string) (*Conv
 
 // --- run bindings ---
 
-// CreateRunBinding records that a run is a task on a conversation. The bound
-// case is set later, when the run's first update_case creates it
-// (design/004-domain-remodel.md §6).
-func (s *Store) CreateRunBinding(ctx context.Context, runID, orgID, conversationID, taskKind string) error {
+// CreateRunBinding records that a run is a task on a conversation, under a
+// playbook. The bound case is set later, when the run's first update_case
+// creates it (design/004-domain-remodel.md §6). playbookID may be empty when a
+// connection has no playbook (the case type then falls back to the default).
+func (s *Store) CreateRunBinding(ctx context.Context, runID, orgID, conversationID, taskKind, playbookID string) error {
+	var pb *string
+	if playbookID != "" {
+		pb = &playbookID
+	}
 	_, err := s.pool.Exec(ctx, `
-		INSERT INTO run_bindings (run_id, org_id, conversation_id, task_kind)
-		VALUES ($1, $2, $3, $4)
+		INSERT INTO run_bindings (run_id, org_id, conversation_id, task_kind, playbook_id)
+		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (run_id) DO NOTHING`,
-		runID, orgID, conversationID, taskKind)
+		runID, orgID, conversationID, taskKind, pb)
 	return err
 }
 
@@ -384,10 +408,15 @@ func (s *Store) UpsertCaseForRun(ctx context.Context, runID, orgID, conversation
 	defer tx.Rollback(ctx)
 
 	// Find the run's bound case, locking the binding so concurrent activity
-	// retries can't create two cases for one run.
+	// retries can't create two cases for one run. The case type is the run's
+	// playbook's case_type (design/004 §8), defaulting when no playbook is bound.
 	var caseID *string
+	var caseType string
 	if err := tx.QueryRow(ctx, `
-		SELECT case_id FROM run_bindings WHERE run_id = $1 FOR UPDATE`, runID).Scan(&caseID); err != nil {
+		SELECT rb.case_id, COALESCE(pb.case_type, 'field_service_job')
+		FROM run_bindings rb
+		LEFT JOIN playbooks pb ON pb.id = rb.playbook_id
+		WHERE rb.run_id = $1 FOR UPDATE OF rb`, runID).Scan(&caseID, &caseType); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, fmt.Errorf("domain: no run binding for run %s", runID)
 		}
@@ -397,9 +426,9 @@ func (s *Store) UpsertCaseForRun(ctx context.Context, runID, orgID, conversation
 		id := agentkit.NewID()
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO cases (id, org_id, conversation_id, customer_id, type)
-			SELECT $1, $2, c.id, c.customer_id, 'field_service_job'
+			SELECT $1, $2, c.id, c.customer_id, $4
 			FROM conversations c WHERE c.id = $3`,
-			id, orgID, conversationID); err != nil {
+			id, orgID, conversationID, caseType); err != nil {
 			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `

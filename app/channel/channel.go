@@ -130,7 +130,7 @@ type Router struct {
 	agentkit  akstore.Store
 	temporal  temporalclient.Client
 	taskQueue string
-	agent     string // the single seeded playbook until playbook selection lands (design/002 §10)
+	agent     string // fallback agent when a connection has no playbook; playbook selection is the norm (design/004 §8)
 }
 
 func NewRouter(store *domain.Store, ak akstore.Store, tc temporalclient.Client, taskQueue, agent string) *Router {
@@ -154,7 +154,21 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 		return RouteResult{}, err
 	}
 
-	runID, err := r.ensureRun(ctx, conn.OrgID, conv)
+	// The connection routes inbound to a playbook, which selects the agent (pack)
+	// that runs and the case type it produces (design/004 §8). Fall back to the
+	// Router's default agent when a connection has no playbook.
+	agentName := r.agent
+	playbookID := ""
+	if conn.DefaultPlaybookID != "" {
+		pb, err := r.store.GetPlaybook(ctx, conn.DefaultPlaybookID)
+		if err != nil {
+			return RouteResult{}, fmt.Errorf("resolve playbook: %w", err)
+		}
+		agentName = pb.Agent
+		playbookID = pb.ID
+	}
+
+	runID, err := r.ensureRun(ctx, conn.OrgID, conv, agentName, playbookID)
 	if err != nil {
 		return RouteResult{}, err
 	}
@@ -191,7 +205,7 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 			TaskQueue: r.taskQueue,
 		},
 		temporalkit.AgentLoopWorkflowName,
-		temporalkit.AgentLoopInput{RunID: runID, OrgID: conn.OrgID, Agent: r.agent},
+		temporalkit.AgentLoopInput{RunID: runID, OrgID: conn.OrgID, Agent: agentName},
 	)
 	if err != nil {
 		return RouteResult{}, fmt.Errorf("signal workflow: %w", err)
@@ -205,7 +219,7 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 // last run already finished. A finished run means the previous case is done; the
 // new run will open a new case on the same persistent thread
 // (design/004-domain-remodel.md §6).
-func (r *Router) ensureRun(ctx context.Context, orgID string, conv *domain.Conversation) (string, error) {
+func (r *Router) ensureRun(ctx context.Context, orgID string, conv *domain.Conversation, agentName, playbookID string) (string, error) {
 	latest, err := r.store.LatestRunIDForConversation(ctx, conv.ID)
 	if err != nil {
 		return "", err
@@ -223,12 +237,12 @@ func (r *Router) ensureRun(ctx context.Context, orgID string, conv *domain.Conve
 	if err := r.agentkit.CreateRun(ctx, agentkit.Run{
 		ID:     runID,
 		OrgID:  orgID,
-		Agent:  r.agent,
+		Agent:  agentName,
 		Status: agentkit.RunRunning,
 	}); err != nil {
 		return "", err
 	}
-	if err := r.store.CreateRunBinding(ctx, runID, orgID, conv.ID, "intake"); err != nil {
+	if err := r.store.CreateRunBinding(ctx, runID, orgID, conv.ID, "intake", playbookID); err != nil {
 		return "", err
 	}
 	return runID, nil

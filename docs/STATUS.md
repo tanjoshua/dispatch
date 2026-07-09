@@ -135,9 +135,17 @@ end-to-end._
         run still starts without prior thread history — needs transcript assembly
         + fake-LLM turn-count handling); a dedicated unified customer-profile UI
         (the inbox lists threads today, each resolving to one customer).
-  - [ ] **Phase 4 — Playbook substrate** (case type + `Data` schema + toolset/
-        policy config; `update_case` schema playbook‑driven; connection→playbook
-        binding). **Phase 5 (own doc) — pack SDK + second vertical.**
+  - [x] **Phase 4 — Playbook substrate.** Migration `0008`: `playbooks` table
+        (selects the code agent/pack + names the case type it produces), seeded
+        `pb_field_service` (agent `intake`, case type `field_service_job`).
+        A channel connection routes inbound to a `default_playbook_id`; the Router
+        resolves the playbook, runs its agent, and records `run_bindings.playbook_id`
+        so the case type is derived from the playbook (not hardcoded). With one pack
+        this is the *selection* seam the horizontal story hangs on. Verified: build/
+        vet/test, migration applied + `chan_dev` bound + all bindings backfilled;
+        Router playbook resolution + case_type derivation checked live.
+        **Deferred to Phase 5 (own doc):** config‑parameterized `update_case`
+        InputSchema / prompts / policy (the pack SDK) + a second vertical.
 - [ ] Live call through the Anthropic adapter (no API key in the dev
       environment; adapter compiles against the current SDK but is unexercised)
 - [ ] Automated tests (e2e was exercised manually via the API; no `_test.go`
