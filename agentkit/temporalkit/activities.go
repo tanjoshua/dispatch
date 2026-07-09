@@ -225,9 +225,20 @@ func (a *Activities) ExecuteAction(ctx context.Context, in ExecuteActionInput) (
 		return nil, fmt.Errorf("temporalkit: agent %s has no tool %q", in.Agent, action.Tool)
 	}
 
-	// The one place a tool ever executes: inside the action pipeline.
-	execCtx := agentkit.WithRunContext(ctx, agentkit.RunContext{RunID: action.RunID, OrgID: action.OrgID, ActionID: action.ID})
-	result, execErr := tool.Execute(execCtx, action.EffectiveInput())
+	// Validate the effective input — the human edit when present, else the
+	// agent's proposal — against the tool's schema before anything runs. This
+	// is the one choke point every execution passes through; a failure is
+	// recorded like any tool failure and fed back so the agent (or the next
+	// human edit) can revise.
+	var result json.RawMessage
+	var execErr error
+	if err := agentkit.ValidateToolInput(tool, action.EffectiveInput()); err != nil {
+		execErr = err
+	} else {
+		// The one place a tool ever executes: inside the action pipeline.
+		execCtx := agentkit.WithRunContext(ctx, agentkit.RunContext{RunID: action.RunID, OrgID: action.OrgID, ActionID: action.ID})
+		result, execErr = tool.Execute(execCtx, action.EffectiveInput())
+	}
 
 	eventType := agentkit.EventActionExecuted
 	execErrMsg := ""

@@ -52,7 +52,8 @@ func (t *sendMessageTool) InputSchema() json.RawMessage {
 		"properties": {
 			"message": {"type": "string", "description": "The message text to send to the customer."}
 		},
-		"required": ["message"]
+		"required": ["message"],
+		"additionalProperties": false
 	}`)
 }
 
@@ -112,7 +113,8 @@ func (t *updateCaseTool) InputSchema() json.RawMessage {
 			"issue": {"type": "string", "description": "Clear description of the problem."},
 			"urgency": {"type": "string", "enum": ["low", "normal", "high", "emergency"], "description": "How urgent the job is."}
 		},
-		"required": []
+		"required": [],
+		"additionalProperties": false
 	}`)
 }
 
@@ -176,7 +178,8 @@ func (t *escalateTool) InputSchema() json.RawMessage {
 			"reason": {"type": "string", "description": "One line for the dispatcher: what's happening and what you've told the customer."},
 			"category": {"type": "string", "enum": ["emergency", "stuck", "other"], "description": "Why you're escalating. Use emergency for danger to people or property."}
 		},
-		"required": ["reason", "category"]
+		"required": ["reason", "category"],
+		"additionalProperties": false
 	}`)
 }
 
@@ -225,7 +228,8 @@ func (t *continueCaseTool) InputSchema() json.RawMessage {
 		"properties": {
 			"reason": {"type": "string", "description": "One line: why this message belongs to the existing job."}
 		},
-		"required": ["reason"]
+		"required": ["reason"],
+		"additionalProperties": false
 	}`)
 }
 
@@ -270,7 +274,8 @@ func (t *closeCaseTool) InputSchema() json.RawMessage {
 		"properties": {
 			"summary": {"type": "string", "description": "One-line summary of the job for the dispatcher."}
 		},
-		"required": ["summary"]
+		"required": ["summary"],
+		"additionalProperties": false
 	}`)
 }
 

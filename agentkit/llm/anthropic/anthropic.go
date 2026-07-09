@@ -59,16 +59,43 @@ func (c *Client) Complete(ctx context.Context, req llm.CompletionRequest) (*llm.
 }
 
 func toSDKTool(t llm.ToolDef) (*sdk.ToolParam, error) {
-	var schema struct {
-		Properties map[string]any `json:"properties"`
-		Required   []string       `json:"required"`
-	}
+	var schema map[string]json.RawMessage
 	if err := json.Unmarshal(t.InputSchema, &schema); err != nil {
 		return nil, fmt.Errorf("anthropic: tool %s: invalid input schema: %w", t.Name, err)
 	}
-	inputSchema := sdk.ToolInputSchemaParam{Properties: schema.Properties}
-	if len(schema.Required) > 0 {
-		inputSchema.Required = schema.Required
+	var inputSchema sdk.ToolInputSchemaParam
+	// Typed fields for the keywords the SDK models; every other keyword
+	// (additionalProperties, enum refinements, etc.) passes through untouched —
+	// the schema is the contract, and silently dropping constraints here would
+	// let the model produce input the ExecuteAction validator then rejects.
+	for key, raw := range schema {
+		switch key {
+		case "type":
+			// constant "object", implied by the SDK
+		case "properties":
+			var props map[string]any
+			if err := json.Unmarshal(raw, &props); err != nil {
+				return nil, fmt.Errorf("anthropic: tool %s: invalid properties: %w", t.Name, err)
+			}
+			inputSchema.Properties = props
+		case "required":
+			var req []string
+			if err := json.Unmarshal(raw, &req); err != nil {
+				return nil, fmt.Errorf("anthropic: tool %s: invalid required: %w", t.Name, err)
+			}
+			if len(req) > 0 {
+				inputSchema.Required = req
+			}
+		default:
+			var v any
+			if err := json.Unmarshal(raw, &v); err != nil {
+				return nil, fmt.Errorf("anthropic: tool %s: invalid schema key %q: %w", t.Name, key, err)
+			}
+			if inputSchema.ExtraFields == nil {
+				inputSchema.ExtraFields = map[string]any{}
+			}
+			inputSchema.ExtraFields[key] = v
+		}
 	}
 	return &sdk.ToolParam{
 		Name:        t.Name,
