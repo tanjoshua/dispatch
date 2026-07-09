@@ -198,6 +198,56 @@ func (t *escalateTool) Execute(ctx context.Context, input json.RawMessage) (json
 	return json.RawMessage(`{"status":"escalated"}`), nil
 }
 
+// --- continue_case ---
+
+// continueCaseTool attaches a triage run to the thread's most recent case, so
+// the customer's follow-up updates the job they already reported instead of
+// opening a duplicate (OVERVIEW §6.3 #11). Auto-approved: like update_case it
+// is internal record-keeping — anything customer-visible still goes through
+// send_message and its policy.
+type continueCaseTool struct {
+	store *domain.Store
+}
+
+type continueCaseInput struct {
+	Reason string `json:"reason"`
+}
+
+func (t *continueCaseTool) Name() string { return "continue_case" }
+
+func (t *continueCaseTool) Description() string {
+	return "Attach this task to the customer's most recent existing job on this thread instead of opening a new one — use when their message adds to, corrects, or reopens that job. After this, update_case edits that job. Needs no approval."
+}
+
+func (t *continueCaseTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{
+		"type": "object",
+		"properties": {
+			"reason": {"type": "string", "description": "One line: why this message belongs to the existing job."}
+		},
+		"required": ["reason"]
+	}`)
+}
+
+func (t *continueCaseTool) Execute(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
+	var in continueCaseInput
+	if err := json.Unmarshal(input, &in); err != nil {
+		return nil, fmt.Errorf("continue_case: invalid input: %w", err)
+	}
+	if in.Reason == "" {
+		return nil, fmt.Errorf("continue_case: reason is empty")
+	}
+	runID, _, err := runAndThread(ctx, t.store)
+	if err != nil {
+		return nil, err
+	}
+	c, err := t.store.BindRunToLatestCase(ctx, runID)
+	if err != nil {
+		return nil, fmt.Errorf("continue_case: %w", err)
+	}
+	return json.Marshal(c)
+}
+
 // --- close_case ---
 
 type closeCaseTool struct {
@@ -211,7 +261,7 @@ type closeCaseInput struct {
 func (t *closeCaseTool) Name() string { return "close_case" }
 
 func (t *closeCaseTool) Description() string {
-	return "Mark intake complete and end the conversation. Only call this after the job record has the customer's name, address, issue, and urgency, and you have sent the customer a recap."
+	return "Mark this task complete. For an intake: only call after the job record has the customer's name, address, issue, and urgency, and you have sent the customer a recap. If this task didn't touch a job record (you were only answering a question), this simply ends the task."
 }
 
 func (t *closeCaseTool) InputSchema() json.RawMessage {
@@ -236,6 +286,11 @@ func (t *closeCaseTool) Execute(ctx context.Context, input json.RawMessage) (jso
 	c, err := t.store.CompleteCaseForRun(ctx, runID)
 	if err != nil {
 		return nil, fmt.Errorf("close_case: %w", err)
+	}
+	if c == nil {
+		// A triage run that never touched a case (answered a question) ends
+		// with no case — the run completes all the same.
+		return json.Marshal(map[string]any{"status": "task_complete", "summary": in.Summary})
 	}
 	return json.Marshal(map[string]any{"status": "intake_complete", "case": c, "summary": in.Summary})
 }

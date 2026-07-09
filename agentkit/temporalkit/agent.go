@@ -74,6 +74,13 @@ type AgentLoopInput struct {
 	OrgID string `json:"org_id"`
 	Agent string `json:"agent"` // agent definition name
 
+	// SystemContext is per-run context the application assembles when it
+	// creates the run — a briefing: who this is, what happened before the run
+	// started. It is appended to the agent definition's system prompt on every
+	// completion (stable within the run, so the prompt-cache prefix holds).
+	// agentkit does not interpret it — this is the context-hydration seam.
+	SystemContext string `json:"system_context,omitempty"`
+
 	// Messages carries accumulated conversation context across
 	// ContinueAsNew. Empty on a fresh run.
 	Messages []llm.Message `json:"messages,omitempty"`

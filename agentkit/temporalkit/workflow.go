@@ -215,11 +215,12 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflo
 
 		var resp llm.CompletionResponse
 		err := workflow.ExecuteActivity(llmCtx, "Complete", CompleteInput{
-			RunID:    input.RunID,
-			OrgID:    input.OrgID,
-			Agent:    input.Agent,
-			Seq:      *llmCalls,
-			Messages: log.messages,
+			RunID:         input.RunID,
+			OrgID:         input.OrgID,
+			Agent:         input.Agent,
+			Seq:           *llmCalls,
+			Messages:      log.messages,
+			SystemContext: input.SystemContext,
 		}).Get(llmCtx, &resp)
 		if err != nil {
 			return false, fmt.Errorf("llm completion: %w", err)

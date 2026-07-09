@@ -17,11 +17,12 @@ import (
 func TestIntakePolicyRouting(t *testing.T) {
 	policy := Definition("test-model", nil, nil).Policy
 	cases := map[string]agentkit.PolicyDecision{
-		"update_case":  agentkit.AutoApprove,
-		"escalate":     agentkit.AutoApprove, // raising an alarm needs no permission
-		"send_message": agentkit.RequireApproval,
-		"close_case":   agentkit.RequireApproval,
-		"unknown_tool": agentkit.RequireApproval, // default is the safe one
+		"update_case":   agentkit.AutoApprove,
+		"continue_case": agentkit.AutoApprove, // record-keeping, same footing as update_case
+		"escalate":      agentkit.AutoApprove, // raising an alarm needs no permission
+		"send_message":  agentkit.RequireApproval,
+		"close_case":    agentkit.RequireApproval,
+		"unknown_tool":  agentkit.RequireApproval, // default is the safe one
 	}
 	for tool, want := range cases {
 		if got := policy.Evaluate(context.Background(), agentkit.Action{Tool: tool}); got != want {

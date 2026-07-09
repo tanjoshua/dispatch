@@ -43,6 +43,10 @@ type CompleteInput struct {
 	Agent    string        `json:"agent"`
 	Seq      int           `json:"seq"`
 	Messages []llm.Message `json:"messages"`
+	// SystemContext is the run's briefing (AgentLoopInput.SystemContext),
+	// appended after the agent definition's system prompt — definition first
+	// so the most stable text leads (prompt caching).
+	SystemContext string `json:"system_context,omitempty"`
 }
 
 func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*llm.CompletionResponse, error) {
@@ -50,9 +54,13 @@ func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*llm.Compl
 	if err != nil {
 		return nil, err
 	}
+	system := def.System
+	if in.SystemContext != "" {
+		system += "\n\n" + in.SystemContext
+	}
 	resp, err := a.LLM.Complete(ctx, llm.CompletionRequest{
 		Model:     def.Model,
-		System:    def.System,
+		System:    system,
 		Messages:  in.Messages,
 		Tools:     def.toolDefs(),
 		MaxTokens: def.MaxTokens,

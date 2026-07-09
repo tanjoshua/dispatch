@@ -470,6 +470,33 @@ func (s *Store) AddInboundMessage(ctx context.Context, m Message) (*Message, boo
 	return msg, true, err
 }
 
+// ListRecentMessages returns the thread's newest limit messages, oldest first
+// — the briefing's recent-message window.
+func (s *Store) ListRecentMessages(ctx context.Context, conversationID string, limit int) ([]Message, error) {
+	rows, err := s.pool.Query(ctx,
+		messageSelect+` WHERE conversation_id = $1 ORDER BY created_at DESC, id DESC LIMIT $2`,
+		conversationID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Message
+	for rows.Next() {
+		m, err := scanMessage(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i, j := 0, len(out)-1; i < j; i, j = i+1, j-1 {
+		out[i], out[j] = out[j], out[i]
+	}
+	return out, nil
+}
+
 func (s *Store) ListMessages(ctx context.Context, conversationID string) ([]Message, error) {
 	rows, err := s.pool.Query(ctx,
 		messageSelect+` WHERE conversation_id = $1 ORDER BY created_at, id`, conversationID)
@@ -583,10 +610,63 @@ func (s *Store) UpsertCaseForRun(ctx context.Context, runID, orgID, conversation
 	return s.GetCase(ctx, *caseID)
 }
 
-// CompleteCaseForRun marks the run's bound case intake_complete. It does NOT
+// BindRunToLatestCase attaches an unbound run to the thread's most recent case
+// — the continue_case tool: the run's work targets that case instead of
+// opening a new one, and a completed case reopens for intake. Idempotent under
+// activity retries: a run already bound returns its bound case unchanged.
+func (s *Store) BindRunToLatestCase(ctx context.Context, runID string) (*Case, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+
+	var conversationID string
+	var boundCaseID *string
+	if err := tx.QueryRow(ctx, `
+		SELECT conversation_id, case_id FROM run_bindings
+		WHERE run_id = $1 FOR UPDATE`, runID).Scan(&conversationID, &boundCaseID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("domain: no run binding for run %s", runID)
+		}
+		return nil, err
+	}
+	if boundCaseID != nil {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return s.GetCase(ctx, *boundCaseID)
+	}
+
+	var caseID string
+	if err := tx.QueryRow(ctx, `
+		SELECT id FROM cases WHERE conversation_id = $1
+		ORDER BY created_at DESC LIMIT 1`, conversationID).Scan(&caseID); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, fmt.Errorf("domain: no previous case on this thread to continue")
+		}
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE run_bindings SET case_id = $2 WHERE run_id = $1`, runID, caseID); err != nil {
+		return nil, err
+	}
+	if _, err := tx.Exec(ctx, `
+		UPDATE cases SET status = 'intake', updated_at = now()
+		WHERE id = $1 AND status = 'intake_complete'`, caseID); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return s.GetCase(ctx, caseID)
+}
+
+// CompleteCaseForRun marks the run's bound case intake_complete. A run that
+// never touched a case (a triage run that only answered a question) completes
+// with a nil case — ending the task without one is legitimate. It does NOT
 // close the thread — threads are persistent (design/004-domain-remodel.md §4);
-// the next customer message starts a fresh run and a fresh case on the same
-// thread.
+// the next customer message starts a fresh run on the same thread.
 func (s *Store) CompleteCaseForRun(ctx context.Context, runID string) (*Case, error) {
 	var caseID *string
 	if err := s.pool.QueryRow(ctx, `
@@ -597,7 +677,7 @@ func (s *Store) CompleteCaseForRun(ctx context.Context, runID string) (*Case, er
 		return nil, err
 	}
 	if caseID == nil {
-		return nil, fmt.Errorf("domain: run %s has no case to complete", runID)
+		return nil, nil
 	}
 	if _, err := s.pool.Exec(ctx, `
 		UPDATE cases SET status = 'intake_complete', updated_at = now() WHERE id = $1`, *caseID); err != nil {

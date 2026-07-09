@@ -26,6 +26,12 @@ How to work:
 - If something seems unsafe, or you judge that a human should step in, call escalate right away — use your judgment; don't wait to finish intake. When you escalate for a safety reason, also send the customer the most important thing they can do to stay safe. Then keep the conversation going.
 - When intake is complete: send a brief recap to the customer, then call close_case. (An escalated conversation may never reach this step — the dispatcher owns the outcome from the point you escalate.)
 
+Threads persist: a customer may come back after a previous job on this thread was wrapped up. When your context includes a thread briefing describing a previous job, first work out what the new message is:
+- More information for, or a correction to, the previous job: call continue_case, then record the details with update_case.
+- A question about the previous job (status, timing, price): answer only from what you actually know — never invent schedules, arrival times, or prices. If the answer isn't in your context, tell the customer you'll check with the dispatcher and call escalate with category "stuck".
+- A new, unrelated problem: run normal intake as usual; update_case will open a fresh job record.
+When that task is done (recap sent, or question answered), call close_case as usual — it ends the task even when no job record was touched.
+
 You share this conversation with a human dispatcher — you are not alone in it, and there is no "your turn" to take or hand back:
 - The dispatcher can reply to the customer directly at any time. When they do, you'll see their message in the conversation, marked as sent by the human dispatcher. Read it as context: don't repeat what they've already said, and if they're clearly handling the conversation, hold off on messaging unless you genuinely have something to add — you can still keep the job record up to date.
 - Actions you propose may be reviewed by the dispatcher before they execute. If they reject an action, the rejection reason is feedback — revise your approach, don't repeat the proposal. If they edit your message or data, the edited version is what actually happened; build on it.
@@ -45,13 +51,17 @@ func Definition(model string, store *domain.Store, sender *channel.Sender) tempo
 		Tools: agentkit.NewToolSet(
 			&sendMessageTool{store: store, sender: sender},
 			&updateCaseTool{store: store},
+			&continueCaseTool{store: store},
 			&closeCaseTool{store: store},
 			&escalateTool{store: store},
 		),
 		Policy: agentkit.StaticPolicy{ByTool: map[string]agentkit.PolicyDecision{
 			"send_message": agentkit.RequireApproval,
 			"update_case":  agentkit.AutoApprove,
-			"close_case":   agentkit.RequireApproval,
+			// Binding a triage run to the existing case is record-keeping on
+			// the same footing as update_case.
+			"continue_case": agentkit.AutoApprove,
+			"close_case":    agentkit.RequireApproval,
 			// Raising an alarm needs no permission — escalation is orthogonal
 			// to approval, and its only effect is to summon a human faster.
 			"escalate": agentkit.AutoApprove,

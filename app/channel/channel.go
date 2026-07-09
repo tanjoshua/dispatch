@@ -27,6 +27,7 @@ import (
 	"dispatch/agentkit"
 	akstore "dispatch/agentkit/store"
 	"dispatch/agentkit/temporalkit"
+	"dispatch/app/briefing"
 	"dispatch/app/domain"
 )
 
@@ -204,6 +205,16 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 		return RouteResult{}, err
 	}
 
+	// Brief the run: customer profile, latest case, recent message window
+	// (minus this message — the agent receives it as its first turn). Computed
+	// on every delivery, not just run creation: SignalWithStart only consumes
+	// the input when it actually starts the workflow, and a crash between
+	// claiming the run and starting it means a later delivery does the start.
+	brief, err := briefing.Assemble(ctx, r.store, conv, customer, msg.ID)
+	if err != nil {
+		return RouteResult{}, err
+	}
+
 	payload, _ := json.Marshal(map[string]string{"message_id": msg.ID, "conversation_id": conv.ID})
 	if err := r.agentkit.AppendEvent(ctx, agentkit.Event{
 		ID:        agentkit.NewID(),
@@ -225,7 +236,7 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 			TaskQueue: r.taskQueue,
 		},
 		temporalkit.AgentLoopWorkflowName,
-		temporalkit.AgentLoopInput{RunID: runID, OrgID: conn.OrgID, Agent: agentName},
+		temporalkit.AgentLoopInput{RunID: runID, OrgID: conn.OrgID, Agent: agentName, SystemContext: brief},
 	)
 	if err != nil {
 		return RouteResult{}, fmt.Errorf("signal workflow: %w", err)
@@ -256,6 +267,17 @@ func (r *Router) ensureRun(ctx context.Context, orgID string, conv *domain.Conve
 		}
 	}
 
+	// A thread that already carries a case gets a triage run, not another
+	// intake: the task is "figure out what this message is about" — continue
+	// that case, answer a question, or open a new one (OVERVIEW §6.3 #11). The
+	// briefing gives the run the history to do that.
+	taskKind := "intake"
+	if _, err := r.store.CurrentCaseForConversation(ctx, conv.ID); err == nil {
+		taskKind = "triage"
+	} else if !errors.Is(err, domain.ErrNotFound) {
+		return "", err
+	}
+
 	// Create a candidate run, then claim the thread's live-run slot for it. A
 	// concurrent delivery may have claimed first — then its run wins and our
 	// unbound candidate is retired.
@@ -268,7 +290,7 @@ func (r *Router) ensureRun(ctx context.Context, orgID string, conv *domain.Conve
 	}); err != nil {
 		return "", err
 	}
-	winner, err := r.store.ClaimRunBinding(ctx, orgID, conv.ID, candidate, "intake", playbookID)
+	winner, err := r.store.ClaimRunBinding(ctx, orgID, conv.ID, candidate, taskKind, playbookID)
 	if err != nil {
 		return "", err
 	}
