@@ -78,11 +78,13 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 			}
 		}
 
-		// Between turns is the safe point to roll over a long history.
-		// Conversation context is carried in the new input.
+		// Between turns is the safe point to roll over a long history. The
+		// transcript lives in Postgres; the new input carries only the
+		// counters and the unflushed delta.
 		if workflow.GetInfo(ctx).GetContinueAsNewSuggested() && inboundCh.Len() == 0 && dispatcherCh.Len() == 0 {
 			next := input
-			next.Messages = log.messages
+			next.TranscriptLen = log.transcriptLen
+			next.PendingMessages = log.pending
 			next.ProcessedMessageIDs = log.seenIDs
 			next.LLMCalls = llmCalls
 			return workflow.NewContinueAsNewError(ctx, AgentLoopWorkflowName, next)
@@ -90,22 +92,26 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 	}
 }
 
-// messageLog is the workflow-side conversation context plus the IDs of external
-// messages already absorbed into it. Channel adapters re-signal on duplicate
-// transport deliveries (webhook retries), and a client may retry the dispatcher
-// reply endpoint — so absorption is keyed on message ID, and each external
-// message informs the agent exactly once.
+// messageLog is the workflow's handle on the run's conversation: how much of
+// the transcript is persisted (run_messages rows), the delta not yet flushed
+// to it, and the IDs of external messages already absorbed. Channel adapters
+// re-signal on duplicate transport deliveries (webhook retries), and a client
+// may retry the dispatcher reply endpoint — so absorption is keyed on message
+// ID, and each external message informs the agent exactly once. The message
+// content itself stays out of workflow history (OVERVIEW §6.1 #3).
 type messageLog struct {
-	messages []llm.Message
-	seenIDs  []string        // append-ordered, deterministic under replay
-	seen     map[string]bool // same contents, for lookup
+	transcriptLen int             // persisted rows; BaseSeq for the next completion
+	pending       []llm.Message   // context awaiting the next completion's flush
+	seenIDs       []string        // append-ordered, deterministic under replay
+	seen          map[string]bool // same contents, for lookup
 }
 
 func newMessageLog(input AgentLoopInput) *messageLog {
 	l := &messageLog{
-		messages: input.Messages,
-		seenIDs:  input.ProcessedMessageIDs,
-		seen:     make(map[string]bool, len(input.ProcessedMessageIDs)),
+		transcriptLen: input.TranscriptLen,
+		pending:       input.PendingMessages,
+		seenIDs:       input.ProcessedMessageIDs,
+		seen:          make(map[string]bool, len(input.ProcessedMessageIDs)),
 	}
 	for _, id := range input.ProcessedMessageIDs {
 		l.seen[id] = true
@@ -136,13 +142,13 @@ func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh workflow.Receive
 	sawCustomer := false
 	absorbInbound := func(m InboundMessage) {
 		if log.mark(m.MessageID) {
-			log.messages = append(log.messages, llm.UserText(m.Text))
+			log.pending = append(log.pending, llm.UserText(m.Text))
 			sawCustomer = true
 		}
 	}
 	absorbDispatcher := func(m DispatcherMessageSignal) {
 		if log.mark(m.MessageID) {
-			log.messages = append(log.messages, DispatcherContextMessage(m.Text))
+			log.pending = append(log.pending, DispatcherContextMessage(m.Text))
 		}
 	}
 	sel := workflow.NewSelector(ctx)
@@ -213,23 +219,28 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflo
 		turnCalls++
 		*llmCalls++
 
-		var resp llm.CompletionResponse
+		var result CompleteResult
 		err := workflow.ExecuteActivity(llmCtx, "Complete", CompleteInput{
 			RunID:         input.RunID,
 			OrgID:         input.OrgID,
 			Agent:         input.Agent,
 			Seq:           *llmCalls,
-			Messages:      log.messages,
+			BaseSeq:       log.transcriptLen,
+			Delta:         log.pending,
 			SystemContext: input.SystemContext,
-		}).Get(llmCtx, &resp)
+		}).Get(llmCtx, &result)
 		if err != nil {
 			return false, fmt.Errorf("llm completion: %w", err)
 		}
+		// The activity flushed the delta (and the assistant turn) to the
+		// transcript; the workflow keeps only the new length.
+		log.transcriptLen = result.TranscriptLen
+		log.pending = nil
+		resp := *result.Response
 		if len(resp.Content) == 0 {
 			logger.Warn("empty completion", "stop_reason", resp.StopReason)
 			return false, nil
 		}
-		log.messages = append(log.messages, llm.AssistantMessage(&resp))
 
 		calls := resp.ToolCalls()
 		if len(calls) == 0 {
@@ -257,8 +268,9 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflo
 		}
 		// All results for one assistant turn go back in a single user message;
 		// any dispatcher messages that arrived during the turn ride along in
-		// that same turn, keeping conversation roles alternating.
-		log.messages = append(log.messages, toolResultsWithNotes(results, notes))
+		// that same turn, keeping conversation roles alternating. It joins the
+		// pending delta — flushed by the next completion.
+		log.pending = append(log.pending, toolResultsWithNotes(results, notes))
 		if terminal {
 			return true, nil
 		}

@@ -106,8 +106,13 @@ type Conversation struct {
 	AttentionState  AttentionState     `json:"attention_state"`
 	AttentionReason string             `json:"attention_reason,omitempty"`
 	EscalatedAt     *time.Time         `json:"escalated_at,omitempty"`
-	CreatedAt       time.Time          `json:"created_at"`
-	UpdatedAt       time.Time          `json:"updated_at"`
+	// ThreadSummary is the rolling record of what past tasks on this thread
+	// were about: one dated line per completed task, taken from the
+	// dispatcher-approved close_case summary. Briefings feed it to fresh runs
+	// so a returning customer isn't met cold (OVERVIEW §6.4).
+	ThreadSummary string    `json:"thread_summary,omitempty"`
+	CreatedAt     time.Time `json:"created_at"`
+	UpdatedAt     time.Time `json:"updated_at"`
 }
 
 type Direction string

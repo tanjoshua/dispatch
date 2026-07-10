@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"dispatch/agentkit"
 	"dispatch/app/channel"
@@ -284,13 +285,21 @@ func (t *closeCaseTool) Execute(ctx context.Context, input json.RawMessage) (jso
 	if err := json.Unmarshal(input, &in); err != nil {
 		return nil, fmt.Errorf("close_case: invalid input: %w", err)
 	}
-	runID, _, err := runAndThread(ctx, t.store)
+	runID, conv, err := runAndThread(ctx, t.store)
 	if err != nil {
 		return nil, err
 	}
 	c, err := t.store.CompleteCaseForRun(ctx, runID)
 	if err != nil {
 		return nil, fmt.Errorf("close_case: %w", err)
+	}
+	// The summary the dispatcher approved becomes one line of the thread's
+	// rolling summary — the briefing a future run on this thread starts from.
+	if in.Summary != "" {
+		line := time.Now().Format("2006-01-02") + " — " + in.Summary
+		if err := t.store.AppendThreadSummary(ctx, conv.ID, line); err != nil {
+			return nil, fmt.Errorf("close_case: %w", err)
+		}
 	}
 	if c == nil {
 		// A triage run that never touched a case (answered a question) ends

@@ -81,9 +81,17 @@ type AgentLoopInput struct {
 	// agentkit does not interpret it — this is the context-hydration seam.
 	SystemContext string `json:"system_context,omitempty"`
 
-	// Messages carries accumulated conversation context across
-	// ContinueAsNew. Empty on a fresh run.
-	Messages []llm.Message `json:"messages,omitempty"`
+	// TranscriptLen is how much of the run's conversation is persisted (the
+	// run_messages row count). The workflow carries only this counter — the
+	// content lives in Postgres and is assembled by the Complete activity, so
+	// Temporal history stays O(n) instead of embedding the transcript in
+	// every completion input (OVERVIEW §6.1 #3).
+	TranscriptLen int `json:"transcript_len,omitempty"`
+
+	// PendingMessages is context not yet flushed to the transcript (an
+	// inbound backlog, the last turn's tool results); the next completion
+	// flushes it. Small by construction; carried across ContinueAsNew.
+	PendingMessages []llm.Message `json:"pending_messages,omitempty"`
 
 	// ProcessedMessageIDs carries the IDs of customer/dispatcher messages
 	// already absorbed into Messages. Channel adapters re-signal on duplicate

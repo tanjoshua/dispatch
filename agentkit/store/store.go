@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 
 	"dispatch/agentkit"
+	"dispatch/agentkit/llm"
 )
 
 // Store is the persistence interface the agent loop's activities (and any
@@ -44,4 +45,16 @@ type Store interface {
 	// AppendEvent appends one event, ignoring duplicates by dedupe key.
 	AppendEvent(ctx context.Context, event agentkit.Event) error
 	ListEventsByRun(ctx context.Context, runID string) ([]agentkit.Event, error)
+
+	// The run transcript: the agent's conversation context, one row per
+	// message, sequence numbers assigned by the workflow (deterministic under
+	// replay). Appends are idempotent per (run_id, seq) — the first write
+	// wins — so retried activities never duplicate or rewrite a turn.
+	AppendRunMessages(ctx context.Context, runID, orgID string, baseSeq int, msgs []llm.Message) error
+	// ListRunMessages returns transcript rows with seq < upTo, in order. upTo
+	// bounds the read to what the caller knows exists, so a retried activity
+	// assembles the same context it did the first time.
+	ListRunMessages(ctx context.Context, runID string, upTo int) ([]llm.Message, error)
+	// GetRunMessage returns the message at seq, or ok=false if absent.
+	GetRunMessage(ctx context.Context, runID string, seq int) (msg *llm.Message, ok bool, err error)
 }

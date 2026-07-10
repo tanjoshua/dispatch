@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -200,13 +201,15 @@ func (s *Store) GetChannelConnection(ctx context.Context, id string) (*ChannelCo
 
 const conversationSelect = `
 	SELECT id, org_id, customer_id, channel_id, status,
-	       attention_state, attention_reason, escalated_at, created_at, updated_at
+	       attention_state, attention_reason, escalated_at, thread_summary,
+	       created_at, updated_at
 	FROM conversations`
 
 func (s *Store) scanConversation(row pgx.Row) (*Conversation, error) {
 	var c Conversation
 	err := row.Scan(&c.ID, &c.OrgID, &c.CustomerID, &c.ChannelID, &c.Status,
-		&c.AttentionState, &c.AttentionReason, &c.EscalatedAt, &c.CreatedAt, &c.UpdatedAt)
+		&c.AttentionState, &c.AttentionReason, &c.EscalatedAt, &c.ThreadSummary,
+		&c.CreatedAt, &c.UpdatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -660,6 +663,43 @@ func (s *Store) BindRunToLatestCase(ctx context.Context, runID string) (*Case, e
 		return nil, err
 	}
 	return s.GetCase(ctx, caseID)
+}
+
+// threadSummaryLines caps the rolling summary: enough for a briefing to cover
+// the thread's recent history without growing unboundedly.
+const threadSummaryLines = 5
+
+// AppendThreadSummary appends one dated line — the dispatcher-approved
+// close_case summary — to the thread's rolling summary, keeping the newest
+// threadSummaryLines. Idempotent under tool-execution retries: a line already
+// present is not re-appended.
+func (s *Store) AppendThreadSummary(ctx context.Context, conversationID, line string) error {
+	if line == "" {
+		return nil
+	}
+	var current string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT thread_summary FROM conversations WHERE id = $1`, conversationID).Scan(&current); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if strings.Contains(current, line) {
+		return nil
+	}
+	lines := []string{}
+	if current != "" {
+		lines = strings.Split(current, "\n")
+	}
+	lines = append(lines, line)
+	if len(lines) > threadSummaryLines {
+		lines = lines[len(lines)-threadSummaryLines:]
+	}
+	_, err := s.pool.Exec(ctx, `
+		UPDATE conversations SET thread_summary = $2, updated_at = now() WHERE id = $1`,
+		conversationID, strings.Join(lines, "\n"))
+	return err
 }
 
 // CompleteCaseForRun marks the run's bound case intake_complete. A run that

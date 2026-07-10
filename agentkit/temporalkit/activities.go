@@ -37,20 +37,56 @@ func (a *Activities) agent(name string) (AgentDefinition, error) {
 // index of this completion within the run (deterministic in the workflow,
 // survives ContinueAsNew); it keys the usage event idempotently, so a retried
 // activity never double-counts.
+//
+// The conversation itself lives in Postgres (run_messages), not in the
+// activity input — embedding it grew Temporal history O(n²). BaseSeq is the
+// persisted transcript length before this completion; Delta is the new
+// context since the last one (inbound messages, tool results), which the
+// activity appends at BaseSeq before assembling the full transcript.
 type CompleteInput struct {
-	RunID    string        `json:"run_id"`
-	OrgID    string        `json:"org_id"`
-	Agent    string        `json:"agent"`
-	Seq      int           `json:"seq"`
-	Messages []llm.Message `json:"messages"`
+	RunID   string        `json:"run_id"`
+	OrgID   string        `json:"org_id"`
+	Agent   string        `json:"agent"`
+	Seq     int           `json:"seq"`
+	BaseSeq int           `json:"base_seq"`
+	Delta   []llm.Message `json:"delta,omitempty"`
 	// SystemContext is the run's briefing (AgentLoopInput.SystemContext),
 	// appended after the agent definition's system prompt — definition first
 	// so the most stable text leads (prompt caching).
 	SystemContext string `json:"system_context,omitempty"`
 }
 
-func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*llm.CompletionResponse, error) {
+// CompleteResult carries the model's reply plus the transcript length after
+// this completion (Delta, plus the assistant turn when one was recorded) —
+// the workflow's BaseSeq for the next call.
+type CompleteResult struct {
+	Response      *llm.CompletionResponse `json:"response"`
+	TranscriptLen int                     `json:"transcript_len"`
+}
+
+func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*CompleteResult, error) {
 	def, err := a.agent(in.Agent)
+	if err != nil {
+		return nil, err
+	}
+	if err := a.Store.AppendRunMessages(ctx, in.RunID, in.OrgID, in.BaseSeq, in.Delta); err != nil {
+		return nil, err
+	}
+	assistantSeq := in.BaseSeq + len(in.Delta)
+
+	// A retried activity whose first attempt already recorded the assistant
+	// turn returns the stored turn: the transcript is the truth, and a second
+	// LLM call would both cost money and diverge from what was persisted.
+	if stored, ok, err := a.Store.GetRunMessage(ctx, in.RunID, assistantSeq); err != nil {
+		return nil, err
+	} else if ok {
+		return &CompleteResult{
+			Response:      &llm.CompletionResponse{Content: stored.Content, StopReason: llm.StopOther},
+			TranscriptLen: assistantSeq + 1,
+		}, nil
+	}
+
+	messages, err := a.Store.ListRunMessages(ctx, in.RunID, assistantSeq)
 	if err != nil {
 		return nil, err
 	}
@@ -61,7 +97,7 @@ func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*llm.Compl
 	resp, err := a.LLM.Complete(ctx, llm.CompletionRequest{
 		Model:     def.Model,
 		System:    system,
-		Messages:  in.Messages,
+		Messages:  messages,
 		Tools:     def.toolDefs(),
 		MaxTokens: def.MaxTokens,
 	})
@@ -69,8 +105,9 @@ func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*llm.Compl
 		return nil, err
 	}
 	// Usage lands in the event log as it happens — it is the billing/eval/cost
-	// substrate and cannot be backfilled. A failed append fails the activity;
-	// the retry may spend another LLM call, but the log stays complete.
+	// substrate and cannot be backfilled. It goes in before the assistant turn:
+	// once the turn exists, retries take the stored-turn path above and would
+	// never write the event.
 	if err := a.Store.AppendEvent(ctx, event(in.OrgID, in.RunID,
 		agentkit.EventLLMCompleted, fmt.Sprintf("llm_completed:%d", in.Seq),
 		map[string]any{
@@ -82,7 +119,17 @@ func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*llm.Compl
 		})); err != nil {
 		return nil, err
 	}
-	return resp, nil
+	// An empty reply is not recorded (an empty assistant turn would poison
+	// future requests); the transcript then ends at the delta.
+	transcriptLen := assistantSeq
+	if len(resp.Content) > 0 {
+		if err := a.Store.AppendRunMessages(ctx, in.RunID, in.OrgID, assistantSeq,
+			[]llm.Message{llm.AssistantMessage(resp)}); err != nil {
+			return nil, err
+		}
+		transcriptLen = assistantSeq + 1
+	}
+	return &CompleteResult{Response: resp, TranscriptLen: transcriptLen}, nil
 }
 
 // TurnBudgetExceededInput records that a turn hit MaxLLMCallsPerTurn. Seq is

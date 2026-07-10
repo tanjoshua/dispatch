@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"dispatch/agentkit"
+	"dispatch/agentkit/llm"
 )
 
 // ErrNotFound is returned when a run or action does not exist.
@@ -253,6 +254,69 @@ func (s *Postgres) DecisionStats(ctx context.Context, orgID string) ([]agentkit.
 		out = append(out, st)
 	}
 	return out, rows.Err()
+}
+
+func (s *Postgres) AppendRunMessages(ctx context.Context, runID, orgID string, baseSeq int, msgs []llm.Message) error {
+	if len(msgs) == 0 {
+		return nil
+	}
+	return s.inTx(ctx, func(tx pgx.Tx) error {
+		for i, m := range msgs {
+			raw, err := json.Marshal(m)
+			if err != nil {
+				return fmt.Errorf("marshal run message: %w", err)
+			}
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO run_messages (run_id, seq, org_id, message)
+				VALUES ($1, $2, $3, $4)
+				ON CONFLICT (run_id, seq) DO NOTHING`,
+				runID, baseSeq+i, orgID, raw); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Postgres) ListRunMessages(ctx context.Context, runID string, upTo int) ([]llm.Message, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT message FROM run_messages
+		WHERE run_id = $1 AND seq < $2 ORDER BY seq`, runID, upTo)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []llm.Message
+	for rows.Next() {
+		var raw []byte
+		if err := rows.Scan(&raw); err != nil {
+			return nil, err
+		}
+		var m llm.Message
+		if err := json.Unmarshal(raw, &m); err != nil {
+			return nil, fmt.Errorf("unmarshal run message: %w", err)
+		}
+		out = append(out, m)
+	}
+	return out, rows.Err()
+}
+
+func (s *Postgres) GetRunMessage(ctx context.Context, runID string, seq int) (*llm.Message, bool, error) {
+	var raw []byte
+	err := s.pool.QueryRow(ctx, `
+		SELECT message FROM run_messages WHERE run_id = $1 AND seq = $2`,
+		runID, seq).Scan(&raw)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	var m llm.Message
+	if err := json.Unmarshal(raw, &m); err != nil {
+		return nil, false, fmt.Errorf("unmarshal run message: %w", err)
+	}
+	return &m, true, nil
 }
 
 // appendEvent inserts one event, ignoring (run_id, dedupe_key) duplicates.

@@ -32,6 +32,10 @@ func Assemble(ctx context.Context, store *domain.Store, conv *domain.Conversatio
 		sections = append(sections, "Customer on file: "+customer.Name)
 	}
 
+	if conv.ThreadSummary != "" {
+		sections = append(sections, "Previous tasks on this thread (dispatcher-approved summaries):\n"+conv.ThreadSummary)
+	}
+
 	c, err := store.CurrentCaseForConversation(ctx, conv.ID)
 	switch {
 	case err == nil:
