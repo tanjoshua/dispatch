@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
-	"strings"
 	"time"
 
 	"dispatch/agentkit"
@@ -33,61 +32,77 @@ func runAndThread(ctx context.Context, store *domain.Store) (string, *domain.Con
 	return rc.RunID, conv, err
 }
 
-// --- send_message ---
-
-type sendMessageTool struct {
+// proposeResponseTool is the reviewed customer-facing unit. Approval releases
+// one response; intake completion is applied only after the adapter confirms
+// delivery returned successfully.
+type proposeResponseTool struct {
 	store  *domain.Store
 	sender *channel.Sender
 }
-
-type sendMessageInput struct {
-	Message string `json:"message"`
+type proposeResponseInput struct {
+	Message                 string `json:"message"`
+	RespondsThroughEventSeq int64  `json:"responds_through_event_seq"`
+	AfterDelivery           struct {
+		CompleteRun        bool   `json:"complete_run"`
+		MarkIntakeComplete bool   `json:"mark_intake_complete"`
+		Summary            string `json:"summary"`
+	} `json:"after_delivery"`
 }
 
-func (t *sendMessageTool) Name() string { return "send_message" }
-
-func (t *sendMessageTool) Description() string {
-	return "Send a WhatsApp reply to the customer. This is the only way to talk to them."
+func (t *proposeResponseTool) Name() string { return "propose_response" }
+func (t *proposeResponseTool) Description() string {
+	return "Propose the single reviewed customer reply and optional delivery-dependent intake completion."
 }
-
-func (t *sendMessageTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{
-		"type": "object",
-		"properties": {
-			"message": {"type": "string", "description": "The message text to send to the customer."}
-		},
-		"required": ["message"],
-		"additionalProperties": false
-	}`)
+func (t *proposeResponseTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"message":{"type":"string","minLength":1},"responds_through_event_seq":{"type":"integer","minimum":1},"after_delivery":{"type":"object","properties":{"complete_run":{"type":"boolean"},"mark_intake_complete":{"type":"boolean"},"summary":{"type":"string"}},"required":["complete_run","mark_intake_complete","summary"],"additionalProperties":false}},"required":["message","responds_through_event_seq","after_delivery"],"additionalProperties":false}`)
 }
-
-func (t *sendMessageTool) Execute(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
-	var in sendMessageInput
-	if err := json.Unmarshal(input, &in); err != nil {
-		return nil, fmt.Errorf("send_message: invalid input: %w", err)
-	}
-	if in.Message == "" {
-		return nil, fmt.Errorf("send_message: message is empty")
+func (t *proposeResponseTool) Execute(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	var in proposeResponseInput
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil, fmt.Errorf("propose_response: %w", err)
 	}
 	rc, ok := agentkit.RunContextFrom(ctx)
 	if !ok {
-		return nil, fmt.Errorf("send_message: no run context (tool executed outside the action pipeline?)")
+		return nil, fmt.Errorf("propose_response: no run context")
 	}
 	conv, err := t.store.GetConversationByRunID(ctx, rc.RunID)
 	if err != nil {
 		return nil, err
 	}
-	// The message ID is the action ID: a retried execution (crash between the
-	// send and FinishAction) re-delivers under the same ID, which persistence
-	// and real providers dedupe on — the customer never gets it twice.
-	if err := t.sender.Send(ctx, conv.OrgID, conv.ID, channel.OutboundMessage{
-		Body:   in.Message,
-		Author: domain.AuthorAgent,
-		ID:     rc.ActionID,
-	}); err != nil {
-		return nil, fmt.Errorf("send_message: %w", err)
+	if conv.EventSeq != in.RespondsThroughEventSeq {
+		return nil, fmt.Errorf("propose_response: stale context: conversation is at event %d", conv.EventSeq)
 	}
-	return json.RawMessage(`{"status":"sent"}`), nil
+	if err := t.sender.Send(ctx, conv.OrgID, conv.ID, channel.OutboundMessage{Body: in.Message, Author: domain.AuthorAgent, ID: rc.ActionID}); err != nil {
+		return nil, err
+	}
+	if in.AfterDelivery.MarkIntakeComplete {
+		if _, err := t.store.CompleteCaseForRun(ctx, rc.RunID); err != nil {
+			return nil, err
+		}
+	}
+	if in.AfterDelivery.Summary != "" {
+		line := time.Now().Format("2006-01-02") + " — " + in.AfterDelivery.Summary
+		if err := t.store.AppendThreadSummary(ctx, conv.ID, line); err != nil {
+			return nil, err
+		}
+	}
+	return json.Marshal(map[string]any{"status": "sent", "complete_run": in.AfterDelivery.CompleteRun})
+}
+
+type pauseTool struct{ name string }
+
+func (t *pauseTool) Name() string { return t.name }
+func (t *pauseTool) Description() string {
+	if t.name == "stand_down" {
+		return "Stand down without messaging the customer."
+	}
+	return "Pause until external information or a new event arrives."
+}
+func (t *pauseTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"reason":{"type":"string"}},"required":["reason"],"additionalProperties":false}`)
+}
+func (t *pauseTool) Execute(_ context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	return raw, nil
 }
 
 // --- update_case ---
@@ -102,71 +117,129 @@ type updateCaseTool struct {
 	store *domain.Store
 }
 
+type updateCaseInput struct {
+	CaseID           string          `json:"case_id"`
+	ExpectedVersion  int64           `json:"expected_version"`
+	Patch            json.RawMessage `json:"patch"`
+	SourceMessageIDs []string        `json:"source_message_ids"`
+}
+
 func (t *updateCaseTool) Name() string { return "update_case" }
 
 func (t *updateCaseTool) Description() string {
-	return "Create or update the structured job record for this conversation. Pass only the fields you have new information for; existing values are kept. The customer's phone number is already known from the channel — don't ask for it."
+	return "Update one explicitly selected customer-owned case using compare-and-set. Exact source message IDs are required."
 }
 
 func (t *updateCaseTool) InputSchema() json.RawMessage {
 	return json.RawMessage(`{
 		"type": "object",
 		"properties": {
-			"customer_name": {"type": "string", "description": "The customer's name."},
-			"address": {"type": "string", "description": "The service address."},
-			"issue": {"type": "string", "description": "Clear description of the problem."},
-			"urgency": {"type": "string", "enum": ["low", "normal", "high", "emergency"], "description": "How urgent the job is."}
+			"case_id": {"type":"string"},
+			"expected_version": {"type":"integer","minimum":1},
+			"patch": {"type":"object","properties":{"address":{"type":"string"},"issue":{"type":"string"},"urgency":{"type":"string","enum":["low","normal","high","emergency"]}},"additionalProperties":false},
+			"source_message_ids": {"type":"array","items":{"type":"string"},"minItems":1}
 		},
-		"required": [],
+		"required": ["case_id","expected_version","patch","source_message_ids"],
 		"additionalProperties": false
 	}`)
 }
 
 func (t *updateCaseTool) Execute(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(input, &fields); err != nil {
+	var in updateCaseInput
+	if err := json.Unmarshal(input, &in); err != nil {
 		return nil, fmt.Errorf("update_case: invalid input: %w", err)
 	}
-	runID, conv, err := runAndThread(ctx, t.store)
+	runID, _, err := runAndThread(ctx, t.store)
 	if err != nil {
 		return nil, err
 	}
-	// customer_name belongs on the customer, not the case — but this tool is
-	// auto-approved, so it may only *fill in* a missing CRM name, never
-	// overwrite one (OVERVIEW §6.2 #8). A proposed change to an existing name
-	// stays in the case data bag, where the dispatcher sees the discrepancy
-	// and owns applying it.
-	if raw, ok := fields["customer_name"]; ok {
-		var name string
-		if err := json.Unmarshal(raw, &name); err != nil {
-			return nil, fmt.Errorf("update_case: invalid customer_name: %w", err)
-		}
-		name = strings.TrimSpace(name)
-		if strings.ContainsAny(name, "\n\r") || len(name) > 120 {
-			return nil, fmt.Errorf("update_case: customer_name must be a single line of at most 120 characters")
-		}
-		applied, err := t.store.SetCustomerNameIfBlank(ctx, conv.CustomerID, name)
-		if err != nil {
-			return nil, fmt.Errorf("update_case: %w", err)
-		}
-		if !applied {
-			// Occupied. Same name → nothing to record; different → leave the
-			// proposal on the case rather than silently rewriting the CRM.
-			if cust, err := t.store.GetCustomer(ctx, conv.CustomerID); err == nil && strings.EqualFold(cust.Name, name) {
-				applied = true
-			}
-		}
-		if applied {
-			delete(fields, "customer_name")
-		}
+	if in.CaseID == "" || in.ExpectedVersion < 1 || len(in.SourceMessageIDs) == 0 {
+		return nil, fmt.Errorf("update_case: explicit case_id, expected_version, and source_message_ids are required")
 	}
-	patch, err := json.Marshal(fields)
+	c, err := t.store.UpdateCase(ctx, runID, in.CaseID, in.ExpectedVersion, in.Patch, in.SourceMessageIDs)
 	if err != nil {
 		return nil, fmt.Errorf("update_case: %w", err)
 	}
-	c, err := t.store.UpsertCaseForRun(ctx, runID, conv.OrgID, conv.ID, patch)
+	return json.Marshal(c)
+}
+
+// --- explicit case resolution ---
+type listCandidateCasesTool struct{ store *domain.Store }
+
+func (t *listCandidateCasesTool) Name() string { return "list_candidate_cases" }
+func (t *listCandidateCasesTool) Description() string {
+	return "List all ongoing and up to three recent completed cases for the resolved customer. Read only."
+}
+func (t *listCandidateCasesTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{},"additionalProperties":false}`)
+}
+func (t *listCandidateCasesTool) Execute(ctx context.Context, _ json.RawMessage) (json.RawMessage, error) {
+	_, conv, err := runAndThread(ctx, t.store)
 	if err != nil {
-		return nil, fmt.Errorf("update_case: %w", err)
+		return nil, err
+	}
+	cs, err := t.store.ListCasesForCustomer(ctx, conv.OrgID, conv.CustomerID, 3)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(cs)
+}
+
+type selectCaseTool struct{ store *domain.Store }
+type selectCaseInput struct {
+	CaseID           string   `json:"case_id"`
+	Reason           string   `json:"reason"`
+	SourceMessageIDs []string `json:"source_message_ids"`
+}
+
+func (t *selectCaseTool) Name() string { return "select_case" }
+func (t *selectCaseTool) Description() string {
+	return "Explicitly bind this run to an existing customer-owned case; never use recency as the reason."
+}
+func (t *selectCaseTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"case_id":{"type":"string"},"reason":{"type":"string"},"source_message_ids":{"type":"array","items":{"type":"string"},"minItems":1}},"required":["case_id","reason","source_message_ids"],"additionalProperties":false}`)
+}
+func (t *selectCaseTool) Execute(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	var in selectCaseInput
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil, err
+	}
+	runID, _, err := runAndThread(ctx, t.store)
+	if err != nil {
+		return nil, err
+	}
+	c, err := t.store.SelectCaseForRun(ctx, runID, in.CaseID, in.Reason, in.SourceMessageIDs)
+	if err != nil {
+		return nil, err
+	}
+	return json.Marshal(c)
+}
+
+type createCaseTool struct{ store *domain.Store }
+type createCaseInput struct {
+	InitialFields    json.RawMessage `json:"initial_fields"`
+	SourceMessageIDs []string        `json:"source_message_ids"`
+}
+
+func (t *createCaseTool) Name() string { return "create_case" }
+func (t *createCaseTool) Description() string {
+	return "Explicitly create and select a new case for a clearly unrelated service problem."
+}
+func (t *createCaseTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"initial_fields":{"type":"object","properties":{"address":{"type":"string"},"issue":{"type":"string"},"urgency":{"type":"string","enum":["low","normal","high","emergency"]}},"additionalProperties":false},"source_message_ids":{"type":"array","items":{"type":"string"},"minItems":1}},"required":["initial_fields","source_message_ids"],"additionalProperties":false}`)
+}
+func (t *createCaseTool) Execute(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	var in createCaseInput
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil, err
+	}
+	runID, _, err := runAndThread(ctx, t.store)
+	if err != nil {
+		return nil, err
+	}
+	c, err := t.store.CreateCaseForRun(ctx, runID, in.InitialFields, in.SourceMessageIDs)
+	if err != nil {
+		return nil, err
 	}
 	return json.Marshal(c)
 }
@@ -194,10 +267,7 @@ func (t *escalateTool) Name() string { return "escalate" }
 // Only say "pages the dispatcher" when a notifier is really wired.
 func (t *escalateTool) Description() string {
 	reach := "This flags the conversation for urgent attention at the top of the dispatcher's queue (no page is sent, so they see it when they next check)."
-	if t.notifier != nil {
-		reach = "This immediately notifies the dispatcher and pulls the conversation to the top of their queue."
-	}
-	return "Flag this conversation for urgent human attention now — call it whenever you judge that a situation is unsafe or that a human dispatcher should step in. " + reach + " It doesn't send the customer anything, so if there's a safety step they should take, send that too. Raising it needs no approval."
+	return "Flag this conversation for urgent human attention now and stand down. " + reach + " It sends neither a customer message nor an external notification. Raising it needs no approval."
 }
 
 func (t *escalateTool) InputSchema() json.RawMessage {
@@ -232,7 +302,7 @@ func (t *escalateTool) Execute(ctx context.Context, input json.RawMessage) (json
 	// failed page degrades to flagged-in-UI (the projection is already set),
 	// and failing the action would retry into newlyFlagged=false — no re-page
 	// anyway, just a spurious tool error in the agent's context.
-	if newlyFlagged && t.notifier != nil {
+	if newlyFlagged && t.notifier != nil { // notification support retained but disabled by Definition
 		e := notify.Escalation{
 			OrgID:          conv.OrgID,
 			ConversationID: conv.ID,
@@ -247,111 +317,4 @@ func (t *escalateTool) Execute(ctx context.Context, input json.RawMessage) (json
 		}
 	}
 	return json.RawMessage(`{"status":"escalated"}`), nil
-}
-
-// --- continue_case ---
-
-// continueCaseTool attaches a triage run to the thread's most recent case, so
-// the customer's follow-up updates the job they already reported instead of
-// opening a duplicate (OVERVIEW §6.3 #11). Auto-approved: like update_case it
-// is internal record-keeping — anything customer-visible still goes through
-// send_message and its policy.
-type continueCaseTool struct {
-	store *domain.Store
-}
-
-type continueCaseInput struct {
-	Reason string `json:"reason"`
-}
-
-func (t *continueCaseTool) Name() string { return "continue_case" }
-
-func (t *continueCaseTool) Description() string {
-	return "Attach this task to the customer's most recent existing job on this thread instead of opening a new one — use when their message adds to, corrects, or reopens that job. After this, update_case edits that job. Needs no approval."
-}
-
-func (t *continueCaseTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{
-		"type": "object",
-		"properties": {
-			"reason": {"type": "string", "description": "One line: why this message belongs to the existing job."}
-		},
-		"required": ["reason"],
-		"additionalProperties": false
-	}`)
-}
-
-func (t *continueCaseTool) Execute(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
-	var in continueCaseInput
-	if err := json.Unmarshal(input, &in); err != nil {
-		return nil, fmt.Errorf("continue_case: invalid input: %w", err)
-	}
-	if in.Reason == "" {
-		return nil, fmt.Errorf("continue_case: reason is empty")
-	}
-	runID, _, err := runAndThread(ctx, t.store)
-	if err != nil {
-		return nil, err
-	}
-	c, err := t.store.BindRunToLatestCase(ctx, runID)
-	if err != nil {
-		return nil, fmt.Errorf("continue_case: %w", err)
-	}
-	return json.Marshal(c)
-}
-
-// --- close_case ---
-
-type closeCaseTool struct {
-	store *domain.Store
-}
-
-type closeCaseInput struct {
-	Summary string `json:"summary"`
-}
-
-func (t *closeCaseTool) Name() string { return "close_case" }
-
-func (t *closeCaseTool) Description() string {
-	return "Mark this task complete. For an intake: only call after the job record has the customer's name, address, issue, and urgency, and you have sent the customer a recap. If this task didn't touch a job record (you were only answering a question), this simply ends the task."
-}
-
-func (t *closeCaseTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{
-		"type": "object",
-		"properties": {
-			"summary": {"type": "string", "description": "One-line summary of the job for the dispatcher."}
-		},
-		"required": ["summary"],
-		"additionalProperties": false
-	}`)
-}
-
-func (t *closeCaseTool) Execute(ctx context.Context, input json.RawMessage) (json.RawMessage, error) {
-	var in closeCaseInput
-	if err := json.Unmarshal(input, &in); err != nil {
-		return nil, fmt.Errorf("close_case: invalid input: %w", err)
-	}
-	runID, conv, err := runAndThread(ctx, t.store)
-	if err != nil {
-		return nil, err
-	}
-	c, err := t.store.CompleteCaseForRun(ctx, runID)
-	if err != nil {
-		return nil, fmt.Errorf("close_case: %w", err)
-	}
-	// The summary the dispatcher approved becomes one line of the thread's
-	// rolling summary — the briefing a future run on this thread starts from.
-	if in.Summary != "" {
-		line := time.Now().Format("2006-01-02") + " — " + in.Summary
-		if err := t.store.AppendThreadSummary(ctx, conv.ID, line); err != nil {
-			return nil, fmt.Errorf("close_case: %w", err)
-		}
-	}
-	if c == nil {
-		// A triage run that never touched a case (answered a question) ends
-		// with no case — the run completes all the same.
-		return json.Marshal(map[string]any{"status": "task_complete", "summary": in.Summary})
-	}
-	return json.Marshal(map[string]any{"status": "intake_complete", "case": c, "summary": in.Summary})
 }

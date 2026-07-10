@@ -32,6 +32,7 @@ const (
 	ActionExecuting         ActionState = "executing"
 	ActionCompleted         ActionState = "completed"
 	ActionFailed            ActionState = "failed"
+	ActionSuperseded        ActionState = "superseded"
 )
 
 // DecisionKind is how an action was decided.
@@ -77,20 +78,24 @@ type Decision struct {
 //   - Rejections require a reason; decisions and results are fed back into
 //     the agent's context.
 type Action struct {
-	ID          string          `json:"id"`
-	OrgID       string          `json:"org_id"`
-	RunID       string          `json:"run_id"`
-	ToolCallID  string          `json:"tool_call_id"` // LLM-assigned ID for the tool call
-	Tool        string          `json:"tool"`
-	Input       json.RawMessage `json:"input"`
-	EditedInput json.RawMessage `json:"edited_input,omitempty"`
-	State       ActionState     `json:"state"`
-	Decision    *Decision       `json:"decision,omitempty"`
-	Result      json.RawMessage `json:"result,omitempty"`
-	Error       string          `json:"error,omitempty"`
-	ProposedAt  time.Time       `json:"proposed_at"`
-	DecidedAt   *time.Time      `json:"decided_at,omitempty"`
-	ExecutedAt  *time.Time      `json:"executed_at,omitempty"`
+	ID                      string          `json:"id"`
+	OrgID                   string          `json:"org_id"`
+	RunID                   string          `json:"run_id"`
+	ToolCallID              string          `json:"tool_call_id"` // LLM-assigned ID for the tool call
+	Tool                    string          `json:"tool"`
+	Input                   json.RawMessage `json:"input"`
+	EditedInput             json.RawMessage `json:"edited_input,omitempty"`
+	State                   ActionState     `json:"state"`
+	Decision                *Decision       `json:"decision,omitempty"`
+	Result                  json.RawMessage `json:"result,omitempty"`
+	Error                   string          `json:"error,omitempty"`
+	Version                 int64           `json:"version"`
+	ContextRevision         int64           `json:"context_revision"`
+	DependencyVersions      json.RawMessage `json:"dependency_versions,omitempty"`
+	RespondsThroughEventSeq int64           `json:"responds_through_event_seq,omitempty"`
+	ProposedAt              time.Time       `json:"proposed_at"`
+	DecidedAt               *time.Time      `json:"decided_at,omitempty"`
+	ExecutedAt              *time.Time      `json:"executed_at,omitempty"`
 }
 
 // EffectiveInput is what should actually execute: the human-edited input when

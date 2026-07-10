@@ -159,9 +159,13 @@ func (r *Router) Receive(ctx context.Context, conn domain.ChannelConnection, in 
 	// The persistent thread for this (customer, channel). It is durable across
 	// runs and cases (design/004-domain-remodel.md §4) — get-or-create, never
 	// gated on status.
-	conv, err := r.store.ThreadForCustomerChannel(ctx, conn.OrgID, customer.ID, conn.ID)
+	identity, err := r.store.IdentityByAddress(ctx, conn.OrgID, conn.Kind, in.From)
+	if err != nil {
+		return RouteResult{}, err
+	}
+	conv, err := r.store.ThreadForIdentityChannel(ctx, conn.OrgID, identity.ID, conn.ID)
 	if errors.Is(err, domain.ErrNotFound) {
-		conv, err = r.store.CreateConversation(ctx, conn.OrgID, customer.ID, conn.ID)
+		conv, err = r.store.CreateConversation(ctx, conn.OrgID, customer.ID, conn.ID, identity.ID)
 	}
 	if err != nil {
 		return RouteResult{}, err
@@ -272,9 +276,9 @@ func (r *Router) ensureRun(ctx context.Context, orgID string, conv *domain.Conve
 	// that case, answer a question, or open a new one (OVERVIEW §6.3 #11). The
 	// briefing gives the run the history to do that.
 	taskKind := "intake"
-	if _, err := r.store.CurrentCaseForConversation(ctx, conv.ID); err == nil {
+	if cases, err := r.store.ListCasesForCustomer(ctx, conv.OrgID, conv.CustomerID, 1); err == nil && len(cases) > 0 {
 		taskKind = "triage"
-	} else if !errors.Is(err, domain.ErrNotFound) {
+	} else if err != nil {
 		return "", err
 	}
 

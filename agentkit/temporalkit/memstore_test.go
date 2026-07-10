@@ -114,6 +114,36 @@ func (m *memStore) RecordDecision(_ context.Context, actionID string, decision a
 	return &cp, nil
 }
 
+func (m *memStore) DecideAction(_ context.Context, cmd store.DecisionCommand) (*agentkit.Action, bool, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	a, ok := m.actions[cmd.ActionID]
+	if !ok || a.OrgID != cmd.OrgID {
+		return nil, false, store.ErrNotFound
+	}
+	if a.State != agentkit.ActionPendingApproval {
+		return nil, false, store.ErrAlreadyResolved
+	}
+	if a.Version != cmd.ExpectedActionVersion {
+		return nil, false, store.ErrVersionConflict
+	}
+	now := time.Now()
+	d := cmd.Decision
+	a.Decision = &d
+	a.EditedInput = cmd.EditedInput
+	a.DecidedAt = &now
+	a.Version++
+	a.State = agentkit.ActionApproved
+	if d.Kind == agentkit.DecisionApproveWithEdits {
+		a.State = agentkit.ActionApprovedWithEdits
+	}
+	if d.Kind == agentkit.DecisionReject || d.Kind == agentkit.DecisionDismiss {
+		a.State = agentkit.ActionRejected
+	}
+	cp := *a
+	return &cp, false, nil
+}
+
 func (m *memStore) FinishAction(_ context.Context, actionID string, result json.RawMessage, execErr string, event agentkit.Event) (*agentkit.Action, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()

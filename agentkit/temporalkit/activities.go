@@ -23,6 +23,9 @@ type Activities struct {
 	// conversation, page someone). agentkit stays domain-blind — reacting to a
 	// tripped safety rail is the app's business.
 	TurnBudgetExceeded func(ctx context.Context, runID, orgID string) error
+	// ActionContext supplies application-owned freshness dependencies without
+	// making agentkit import the application domain.
+	ActionContext func(ctx context.Context, runID string) (revision int64, dependencies json.RawMessage, err error)
 }
 
 func (a *Activities) agent(name string) (AgentDefinition, error) {
@@ -210,6 +213,21 @@ func (a *Activities) ProposeAction(ctx context.Context, in ProposeActionInput) (
 		Tool:       in.Call.Name,
 		Input:      in.Call.Input,
 		State:      agentkit.ActionPendingApproval,
+	}
+	if a.ActionContext != nil {
+		rev, deps, err := a.ActionContext(ctx, in.RunID)
+		if err != nil {
+			return nil, err
+		}
+		action.ContextRevision = rev
+		action.DependencyVersions = deps
+	}
+	if in.Call.Name == "propose_response" {
+		var p struct {
+			RespondsThroughEventSeq int64 `json:"responds_through_event_seq"`
+		}
+		_ = json.Unmarshal(in.Call.Input, &p)
+		action.RespondsThroughEventSeq = p.RespondsThroughEventSeq
 	}
 	stored, err := a.Store.ProposeAction(ctx, action, event(action.OrgID, action.RunID,
 		agentkit.EventActionProposed, "action_proposed:"+in.Call.ID,

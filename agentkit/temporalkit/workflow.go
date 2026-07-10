@@ -24,7 +24,7 @@ const AgentLoopWorkflowName = "AgentLoop"
 // application summon a human via the Activities hook; the agent resumes on
 // the customer's next message. Per-agent configuration graduates onto
 // AgentDefinition when an agent needs a different ceiling.
-const MaxLLMCallsPerTurn = 10
+const MaxLLMCallsPerTurn = 8
 
 // Register wires the agent loop workflow and its activities into a worker.
 func Register(w worker.Worker, acts *Activities) {
@@ -72,7 +72,7 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 				"no action was awaiting a decision", logger)
 		}
 		if sawCustomer {
-			terminal, err := agentTurn(llmCtx, actCtx, decisionCh, dispatcherCh, input, log, &llmCalls)
+			terminal, err := agentTurn(llmCtx, actCtx, inboundCh, decisionCh, dispatcherCh, input, log, &llmCalls)
 			if err != nil {
 				finishRun(actCtx, input, agentkit.RunFailed, logger)
 				return err
@@ -230,7 +230,7 @@ func finishRun(actCtx workflow.Context, input AgentLoopInput, status agentkit.Ru
 
 // agentTurn runs LLM completions until the agent stops proposing tool calls,
 // a terminal tool executes successfully, or the turn's LLM budget runs out.
-func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog, llmCalls *int) (terminal bool, err error) {
+func agentTurn(llmCtx, actCtx workflow.Context, inboundCh, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog, llmCalls *int) (terminal bool, err error) {
 	logger := workflow.GetLogger(llmCtx)
 
 	turnCalls := 0
@@ -281,12 +281,26 @@ func agentTurn(llmCtx, actCtx workflow.Context, decisionCh, dispatcherCh workflo
 		if len(calls) == 0 {
 			return false, nil // agent yielded; wait for the next inbound message
 		}
+		effectful := 0
+		for _, call := range calls {
+			if call.Name != "list_candidate_cases" {
+				effectful++
+			}
+		}
+		if effectful > 1 || (effectful == 1 && len(calls) > 1) {
+			results := make([]llm.ToolResult, 0, len(calls))
+			for _, call := range calls {
+				results = append(results, llm.ToolResult{ToolCallID: call.ID, IsError: true, Content: "Protocol error: use one or more read-only calls, or exactly one effectful call. Nothing was executed."})
+			}
+			log.pending = append(log.pending, llm.ToolResults(results...))
+			continue
+		}
 
 		var results []llm.ToolResult
 		var notes []string // dispatcher messages that arrived mid-turn
 		standDown := false // a draft was dismissed or superseded: end the turn
 		for _, call := range calls {
-			outcome, note, err := decideAndExecute(actCtx, decisionCh, dispatcherCh, input, log, call)
+			outcome, note, err := decideAndExecute(actCtx, inboundCh, decisionCh, dispatcherCh, input, log, call)
 			if err != nil {
 				return false, err
 			}
@@ -329,7 +343,7 @@ func isStandDown(action *agentkit.Action) bool {
 		return false
 	}
 	return action.Decision.Kind == agentkit.DecisionDismiss ||
-		action.Decision.Kind == agentkit.DecisionSupersede
+		(action.Decision.Kind == agentkit.DecisionSupersede && action.Decision.DecidedBy != "system:inbound")
 }
 
 // toolResultsWithNotes packs one assistant turn's tool results, plus any
@@ -346,7 +360,7 @@ func toolResultsWithNotes(results []llm.ToolResult, notes []string) llm.Message 
 // proposed action waits for a human decision, a dispatcher message may arrive
 // instead — the human answered the customer directly — which supersedes the
 // pending action and returns the dispatcher's text as a context note.
-func decideAndExecute(actCtx workflow.Context, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog, call llm.ToolCall) (*ExecuteActionResult, string, error) {
+func decideAndExecute(actCtx workflow.Context, inboundCh, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog, call llm.ToolCall) (*ExecuteActionResult, string, error) {
 	logger := workflow.GetLogger(actCtx)
 
 	var action agentkit.Action
@@ -368,6 +382,7 @@ func decideAndExecute(actCtx workflow.Context, decisionCh, dispatcherCh workflow
 	for action.State == agentkit.ActionPendingApproval {
 		var decision *DecisionSignal
 		var disp *DispatcherMessageSignal
+		var inbound *InboundMessage
 		sel := workflow.NewSelector(actCtx)
 		sel.AddReceive(decisionCh, func(c workflow.ReceiveChannel, _ bool) {
 			var d DecisionSignal
@@ -379,7 +394,20 @@ func decideAndExecute(actCtx workflow.Context, decisionCh, dispatcherCh workflow
 			c.Receive(actCtx, &m)
 			disp = &m
 		})
+		sel.AddReceive(inboundCh, func(c workflow.ReceiveChannel, _ bool) { var m InboundMessage; c.Receive(actCtx, &m); inbound = &m })
 		sel.Select(actCtx)
+
+		if inbound != nil {
+			if !log.mark(inbound.MessageID) {
+				continue
+			}
+			log.pending = append(log.pending, llm.UserText(ExternalText(inbound.Text)))
+			err := workflow.ExecuteActivity(actCtx, "RecordDecision", RecordDecisionInput{OrgID: input.OrgID, RunID: input.RunID, Decision: DecisionSignal{ActionID: action.ID, Kind: agentkit.DecisionSupersede, DecidedBy: "system:inbound", Reason: "new customer message"}}).Get(actCtx, &action)
+			if err != nil {
+				return nil, "", fmt.Errorf("record inbound supersession: %w", err)
+			}
+			continue
+		}
 
 		if disp != nil {
 			if !log.mark(disp.MessageID) {

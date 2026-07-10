@@ -58,13 +58,17 @@ func (s *Postgres) FinishRun(ctx context.Context, runID string, status agentkit.
 }
 
 func (s *Postgres) ProposeAction(ctx context.Context, action agentkit.Action, event agentkit.Event) (*agentkit.Action, error) {
+	dependencies := action.DependencyVersions
+	if len(dependencies) == 0 {
+		dependencies = json.RawMessage(`{}`)
+	}
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
-			INSERT INTO actions (id, org_id, run_id, tool_call_id, tool, input, state)
-			VALUES ($1, $2, $3, $4, $5, $6, $7)
+			INSERT INTO actions (id, org_id, run_id, tool_call_id, tool, input, state, context_revision, dependency_versions, responds_through_event_seq)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 			ON CONFLICT (run_id, tool_call_id) DO NOTHING`,
 			action.ID, action.OrgID, action.RunID, action.ToolCallID,
-			action.Tool, action.Input, action.State)
+			action.Tool, action.Input, action.State, action.ContextRevision, dependencies, nullInt64(action.RespondsThroughEventSeq))
 		if err != nil {
 			return err
 		}
@@ -91,7 +95,7 @@ func (s *Postgres) RecordDecision(ctx context.Context, actionID string, decision
 		tag, err := tx.Exec(ctx, `
 			UPDATE actions
 			SET state = $2, decision_kind = $3, decided_by = $4,
-			    decision_reason = $5, edited_input = $6, decided_at = now()
+			    decision_reason = $5, edited_input = $6, decided_at = now(), version = version + 1
 			WHERE id = $1 AND decided_at IS NULL`,
 			actionID, state, decision.Kind, decision.DecidedBy, decision.Reason, editedInput)
 		if err != nil {
@@ -106,6 +110,79 @@ func (s *Postgres) RecordDecision(ctx context.Context, actionID string, decision
 		return nil, err
 	}
 	return s.GetAction(ctx, event.OrgID, actionID)
+}
+
+func (s *Postgres) DecideAction(ctx context.Context, cmd DecisionCommand) (*agentkit.Action, bool, error) {
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer tx.Rollback(ctx)
+	var priorAction string
+	err = tx.QueryRow(ctx, `SELECT action_id FROM action_commands WHERE org_id=$1 AND id=$2`, cmd.OrgID, cmd.ID).Scan(&priorAction)
+	if err == nil {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, false, err
+		}
+		a, e := s.GetAction(ctx, cmd.OrgID, priorAction)
+		return a, true, e
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, err
+	}
+	var version, revision, actionRevision int64
+	var state agentkit.ActionState
+	var runID string
+	err = tx.QueryRow(ctx, `SELECT a.version,a.state,a.run_id,c.context_revision,a.context_revision FROM actions a
+		JOIN run_bindings rb ON rb.run_id=a.run_id JOIN conversations c ON c.id=rb.conversation_id
+		WHERE a.id=$1 AND a.org_id=$2 FOR UPDATE OF c,a`, cmd.ActionID, cmd.OrgID).Scan(&version, &state, &runID, &revision, &actionRevision)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, ErrNotFound
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	if state == agentkit.ActionSuperseded || revision != cmd.ExpectedContextRevision || actionRevision != revision {
+		return nil, false, ErrStaleAction
+	}
+	if state != agentkit.ActionPendingApproval {
+		return nil, false, ErrAlreadyResolved
+	}
+	if version != cmd.ExpectedActionVersion {
+		return nil, false, ErrVersionConflict
+	}
+	newState := agentkit.ActionApproved
+	if cmd.Decision.Kind == agentkit.DecisionApproveWithEdits {
+		newState = agentkit.ActionApprovedWithEdits
+	}
+	if cmd.Decision.Kind == agentkit.DecisionReject || cmd.Decision.Kind == agentkit.DecisionDismiss {
+		newState = agentkit.ActionRejected
+	}
+	tag, err := tx.Exec(ctx, `UPDATE actions SET state=$2,decision_kind=$3,decided_by=$4,decision_reason=$5,
+		edited_input=$6,decided_at=now(),version=version+1 WHERE id=$1 AND version=$7 AND state='pending_approval'`,
+		cmd.ActionID, newState, cmd.Decision.Kind, cmd.Decision.DecidedBy, cmd.Decision.Reason, cmd.EditedInput, cmd.ExpectedActionVersion)
+	if err != nil {
+		return nil, false, err
+	}
+	if tag.RowsAffected() == 0 {
+		return nil, false, ErrVersionConflict
+	}
+	payload, _ := json.Marshal(map[string]any{"action_id": cmd.ActionID, "kind": cmd.Decision.Kind, "decided_by": cmd.Decision.DecidedBy, "reason": cmd.Decision.Reason})
+	if _, err := tx.Exec(ctx, `INSERT INTO events(id,org_id,run_id,type,payload,dedupe_key) VALUES($1,$2,$3,$4,$5,$6)
+		ON CONFLICT(run_id,dedupe_key) DO NOTHING`, agentkit.NewID(), cmd.OrgID, runID, agentkit.EventDecisionMade, payload, "decision_command:"+cmd.ID); err != nil {
+		return nil, false, err
+	}
+	request, _ := json.Marshal(map[string]any{"kind": cmd.Decision.Kind, "edited_input": cmd.EditedInput, "reason": cmd.Decision.Reason})
+	result, _ := json.Marshal(map[string]any{"status": "recorded", "action_id": cmd.ActionID})
+	if _, err := tx.Exec(ctx, `INSERT INTO action_commands(id,org_id,action_id,expected_version,expected_context_revision,kind,actor_id,request,result,http_status)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,200)`, cmd.ID, cmd.OrgID, cmd.ActionID, cmd.ExpectedActionVersion, cmd.ExpectedContextRevision, cmd.Decision.Kind, cmd.Decision.DecidedBy, request, result); err != nil {
+		return nil, false, err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, err
+	}
+	a, e := s.GetAction(ctx, cmd.OrgID, cmd.ActionID)
+	return a, false, e
 }
 
 func (s *Postgres) FinishAction(ctx context.Context, actionID string, result json.RawMessage, execErr string, event agentkit.Event) (*agentkit.Action, error) {
@@ -185,7 +262,8 @@ func (s *Postgres) ListEventsByRun(ctx context.Context, orgID, runID string) ([]
 const actionSelect = `
 	SELECT id, org_id, run_id, tool_call_id, tool, input, edited_input, state,
 	       decision_kind, decided_by, decision_reason, result, error,
-	       proposed_at, decided_at, executed_at
+	       proposed_at, decided_at, executed_at, version, context_revision,
+	       dependency_versions, COALESCE(responds_through_event_seq,0)
 	FROM actions`
 
 func (s *Postgres) scanAction(row pgx.Row) (*agentkit.Action, error) {
@@ -194,7 +272,8 @@ func (s *Postgres) scanAction(row pgx.Row) (*agentkit.Action, error) {
 	err := row.Scan(&a.ID, &a.OrgID, &a.RunID, &a.ToolCallID, &a.Tool,
 		&a.Input, &a.EditedInput, &a.State,
 		&decisionKind, &decidedBy, &decisionReason, &a.Result, &execErr,
-		&a.ProposedAt, &a.DecidedAt, &a.ExecutedAt)
+		&a.ProposedAt, &a.DecidedAt, &a.ExecutedAt, &a.Version,
+		&a.ContextRevision, &a.DependencyVersions, &a.RespondsThroughEventSeq)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
@@ -354,4 +433,10 @@ func nullIfEmpty(s string) *string {
 		return nil
 	}
 	return &s
+}
+func nullInt64(v int64) *int64 {
+	if v == 0 {
+		return nil
+	}
+	return &v
 }

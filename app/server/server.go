@@ -31,7 +31,23 @@ type Server struct {
 	// DefaultOrgID scopes the read API (conversation list) until auth lands (a
 	// 000 §8 non-goal). The inbound path no longer reads an org global — it
 	// resolves org from the channel connection (design/002).
-	DefaultOrgID string
+	DefaultOrgID  string
+	ActorProvider ActorProvider
+}
+
+// ActorProvider is the authentication seam for audit attribution. Development
+// uses a configured actor; production can replace it without changing command
+// payloads or trusting client-supplied identities.
+type ActorProvider interface {
+	ActorID(*http.Request) (string, error)
+}
+type StaticActorProvider string
+
+func (p StaticActorProvider) ActorID(*http.Request) (string, error) {
+	if p == "" {
+		return "dispatcher:dev", nil
+	}
+	return string(p), nil
 }
 
 func (s *Server) Handler() http.Handler {
@@ -42,6 +58,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("GET /api/conversations/{id}", s.handleGetConversation)
 	mux.HandleFunc("POST /api/actions/{id}/decision", s.handleDecision)
 	mux.HandleFunc("POST /api/conversations/{id}/reply", s.handleDispatcherReply)
+	mux.HandleFunc("POST /api/conversations/{id}/cases/{caseID}/correction", s.handleCaseCorrection)
 	mux.HandleFunc("POST /api/conversations/{id}/acknowledge", s.handleAcknowledge)
 	mux.HandleFunc("GET /api/runs/{id}/events", s.handleRunEvents)
 	mux.HandleFunc("GET /api/stats/decisions", s.handleDecisionStats)
@@ -153,13 +170,16 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 }
 
 type conversationDetail struct {
-	Conversation domain.Conversation `json:"conversation"`
-	Customer     *domain.Customer    `json:"customer"`
-	Contact      string              `json:"contact"` // customer's address on this thread's channel (design/004 §3)
-	Messages     []domain.Message    `json:"messages"`
-	Case         *domain.Case        `json:"case,omitempty"`
-	Run          *agentkit.Run       `json:"run,omitempty"`
-	Actions      []agentkit.Action   `json:"actions"`
+	Conversation    domain.Conversation     `json:"conversation"`
+	Customer        *domain.Customer        `json:"customer"`
+	Contact         string                  `json:"contact"` // customer's address on this thread's channel (design/004 §3)
+	Messages        []domain.Message        `json:"messages"`
+	Case            *domain.Case            `json:"case,omitempty"`
+	ContactIdentity *domain.ContactIdentity `json:"contact_identity,omitempty"`
+	CandidateCases  []domain.Case           `json:"candidate_cases"`
+	CurrentDraft    *agentkit.Action        `json:"current_draft,omitempty"`
+	Run             *agentkit.Run           `json:"run,omitempty"`
+	Actions         []agentkit.Action       `json:"actions"`
 }
 
 func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
@@ -173,25 +193,33 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	detail := conversationDetail{Conversation: *conv, Actions: []agentkit.Action{}}
+	detail := conversationDetail{Conversation: *conv, Actions: []agentkit.Action{}, CandidateCases: []domain.Case{}}
 	if cust, err := s.Domain.GetCustomer(ctx, conv.CustomerID); err == nil {
 		detail.Customer = cust
 	}
 	detail.Contact, _ = s.Domain.ContactAddressForConversation(ctx, conv.ID)
+	detail.ContactIdentity, _ = s.Domain.GetContactIdentity(ctx, conv.ContactIdentityID)
+	detail.CandidateCases, _ = s.Domain.ListCasesForCustomer(ctx, conv.OrgID, conv.CustomerID, 3)
 	detail.Messages, err = s.Domain.ListMessages(ctx, conv.ID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if c, err := s.Domain.CurrentCaseForConversation(ctx, conv.ID); err == nil {
-		detail.Case = c
-	}
 	if runID, err := s.Domain.LatestRunIDForConversation(ctx, conv.ID); err == nil && runID != "" {
+		if c, err := s.Domain.SelectedCaseForRun(ctx, runID); err == nil {
+			detail.Case = c
+		}
 		if run, err := s.Agentkit.GetRun(ctx, s.DefaultOrgID, runID); err == nil {
 			detail.Run = run
 		}
 		if actions, err := s.Agentkit.ListActionsByRun(ctx, s.DefaultOrgID, runID); err == nil {
 			detail.Actions = actions
+			for i := range actions {
+				if actions[i].State == agentkit.ActionPendingApproval && (actions[i].Tool == "propose_response" || actions[i].Tool == "send_message") {
+					a := actions[i]
+					detail.CurrentDraft = &a
+				}
+			}
 		}
 	}
 	writeJSON(w, http.StatusOK, detail)

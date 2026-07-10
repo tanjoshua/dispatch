@@ -14,16 +14,18 @@ import { Textarea } from '@/components/ui/textarea'
 // context; if a draft was pending, sending here supersedes it.
 export function DispatcherComposer({
   conversationId,
+	contextRevision,
   closed,
 }: {
   conversationId: string
+	contextRevision: number
   closed: boolean
 }) {
   const qc = useQueryClient()
   const [text, setText] = useState('')
 
   const send = useMutation({
-    mutationFn: () => sendDispatcherReply({ conversationId, text: text.trim() }),
+	mutationFn: () => sendDispatcherReply({ conversationId, text: text.trim(), expectedContextRevision: contextRevision, commandId: crypto.randomUUID() }),
     onSuccess: () => {
       setText('')
       qc.invalidateQueries()

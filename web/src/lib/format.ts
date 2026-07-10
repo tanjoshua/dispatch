@@ -48,6 +48,10 @@ export function prettyJson(v: unknown): string {
 // prettified form for tools this map doesn't know yet.
 const toolLabels: Record<string, string> = {
   send_message: 'Reply to customer',
+	propose_response: 'Reply to customer',
+	list_candidate_cases: 'Review customer cases',
+	select_case: 'Select case',
+	create_case: 'Create case',
   update_case: 'Update job record',
   continue_case: 'Continue previous job',
   close_case: 'Complete task',

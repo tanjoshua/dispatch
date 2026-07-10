@@ -9,9 +9,9 @@ package briefing
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"dispatch/app/domain"
 )
@@ -19,7 +19,7 @@ import (
 // recentWindow is how many thread messages the briefing carries, newest-first
 // from the store, rendered oldest-first. Enough to ground a follow-up; the
 // full history stays in Postgres.
-const recentWindow = 10
+const recentWindow = 20
 
 // Assemble builds the briefing for a run on conv. excludeMessageID names the
 // inbound message that triggered the run — it reaches the agent as its first
@@ -29,21 +29,24 @@ func Assemble(ctx context.Context, store *domain.Store, conv *domain.Conversatio
 	var sections []string
 
 	if customer != nil && customer.Name != "" {
-		sections = append(sections, "Customer on file: "+customer.Name)
+		sections = append(sections, fmt.Sprintf("Current time: %s\nConversation revision: %d\nTriggering message ID: %s\nCustomer: %s (version %d)\nExact contact identity: %s",
+			time.Now().UTC().Format(time.RFC3339), conv.ContextRevision, excludeMessageID, customer.Name, customer.Version, conv.ContactIdentityID))
 	}
 
 	if conv.ThreadSummary != "" {
 		sections = append(sections, "Previous tasks on this thread (dispatcher-approved summaries):\n"+conv.ThreadSummary)
 	}
 
-	c, err := store.CurrentCaseForConversation(ctx, conv.ID)
-	switch {
-	case err == nil:
-		sections = append(sections, fmt.Sprintf(
-			"Most recent job record on this thread (status: %s, updated %s):\n%s",
-			c.Status, c.UpdatedAt.Format("2006-01-02"), string(c.Data)))
-	case !errors.Is(err, domain.ErrNotFound):
+	cases, err := store.ListCasesForCustomer(ctx, conv.OrgID, conv.CustomerID, 3)
+	if err != nil {
 		return "", err
+	}
+	if len(cases) > 0 {
+		var lines []string
+		for _, c := range cases {
+			lines = append(lines, fmt.Sprintf("case_id=%s status=%s version=%d updated=%s summary=%q fields=%s", c.ID, c.Status, c.Version, c.UpdatedAt.Format(time.RFC3339), c.Summary, string(c.Data)))
+		}
+		sections = append(sections, "Candidate cases for this customer (all ongoing, then at most three completed; select explicitly, never by recency):\n"+strings.Join(lines, "\n"))
 	}
 
 	msgs, err := store.ListRecentMessages(ctx, conv.ID, recentWindow+1)

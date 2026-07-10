@@ -75,7 +75,7 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 		return llm.ContentBlock{Type: "tool_use", ToolCall: &llm.ToolCall{ID: id(n), Name: name, Input: raw}}
 	}
 	reply := func(text string) llm.ContentBlock {
-		return call(0, "send_message", map[string]string{"message": text})
+		return call(0, "propose_response", map[string]any{"message": text, "responds_through_event_seq": userTurns, "after_delivery": map[string]any{"complete_run": false, "mark_intake_complete": false, "summary": ""}})
 	}
 
 	var content []llm.ContentBlock
@@ -87,28 +87,17 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 	// message, per the real prompt's instructions.
 	case strings.Contains(strings.ToLower(lastText), "gas"):
 		content = []llm.ContentBlock{
-			call(1, "escalate", map[string]string{
+			call(0, "escalate", map[string]string{
 				"reason":   "Possible gas emergency — customer says: " + lastText,
 				"category": "emergency",
 			}),
-			reply("That could be dangerous. Please leave the area, avoid flames or switches, and call your gas company's emergency line. I've alerted our dispatcher to contact you right away."),
 		}
 	case userTurns <= 1:
-		content = []llm.ContentBlock{
-			call(1, "update_case", map[string]string{"issue": lastText}),
-			reply("Thanks for reaching out! I've noted the issue. Could I get your name and the service address?"),
-		}
+		content = []llm.ContentBlock{reply("Thanks for reaching out! Could I get your name and the service address?")}
 	case userTurns == 2:
-		content = []llm.ContentBlock{
-			call(1, "update_case", map[string]string{"customer_name": "Customer", "address": lastText}),
-			reply("Got it. How urgent is this — is it something that needs attention today?"),
-		}
+		content = []llm.ContentBlock{reply("Got it. How urgent is this — is it something that needs attention today?")}
 	default:
-		content = []llm.ContentBlock{
-			call(1, "update_case", map[string]string{"urgency": "normal"}),
-			reply("Perfect, you're all set — the dispatcher will be in touch shortly to schedule."),
-			call(2, "close_case", map[string]string{"summary": "Intake complete: " + lastText}),
-		}
+		content = []llm.ContentBlock{reply("Thanks — the dispatcher has the latest details and will follow up.")}
 	}
 	return &llm.CompletionResponse{Content: content, StopReason: llm.StopToolUse}, nil
 }

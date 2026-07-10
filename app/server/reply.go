@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 
@@ -13,8 +14,9 @@ import (
 )
 
 type dispatcherReplyRequest struct {
-	Text   string `json:"text"`
-	SentBy string `json:"sent_by,omitempty"`
+	Text                    string `json:"text"`
+	CommandID               string `json:"command_id"`
+	ExpectedContextRevision int64  `json:"expected_context_revision"`
 }
 
 // handleDispatcherReply sends a dispatcher's message straight to the customer.
@@ -38,8 +40,18 @@ func (s *Server) handleDispatcherReply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "text is required")
 		return
 	}
-	if req.SentBy == "" {
-		req.SentBy = "dispatcher"
+	if req.CommandID == "" {
+		writeError(w, http.StatusBadRequest, "command_id is required")
+		return
+	}
+	actorProvider := s.ActorProvider
+	if actorProvider == nil {
+		actorProvider = StaticActorProvider("dispatcher:dev")
+	}
+	actor, err := actorProvider.ActorID(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "actor unavailable")
+		return
 	}
 
 	conv, err := s.Domain.GetConversation(ctx, s.DefaultOrgID, convID)
@@ -54,15 +66,30 @@ func (s *Server) handleDispatcherReply(w http.ResponseWriter, r *http.Request) {
 	// Deliver to the customer through the shared outbound path (author =
 	// dispatcher). The message ID is pinned so we can reference the persisted
 	// row in the event and the signal.
-	msgID := agentkit.NewID()
+	msgID := req.CommandID
+	_, duplicate, err := s.Domain.PrepareDispatcherReply(ctx, conv.OrgID, conv.ID, msgID, req.ExpectedContextRevision, req.Text, actor)
+	if errors.Is(err, domain.ErrVersionConflict) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "stale_action", "code": "stale_action"})
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if duplicate {
+		writeJSON(w, http.StatusOK, map[string]string{"status": "sent", "message_id": msgID})
+		return
+	}
 	if err := s.Sender.Send(ctx, conv.OrgID, conv.ID, channel.OutboundMessage{
 		Body:   req.Text,
 		Author: domain.AuthorDispatcher,
 		ID:     msgID,
 	}); err != nil {
+		_ = s.Domain.SetMessageDeliveryState(ctx, msgID, domain.DeliveryUnknown, "", err.Error())
 		writeError(w, http.StatusInternalServerError, "deliver: "+err.Error())
 		return
 	}
+	_ = s.Domain.SetMessageDeliveryState(ctx, msgID, domain.DeliverySent, "", "")
 
 	// Record the human act on the thread's latest run log (no backing agent
 	// Action), the same grain as an escalation acknowledgement. A persistent
@@ -76,7 +103,7 @@ func (s *Server) handleDispatcherReply(w http.ResponseWriter, r *http.Request) {
 		payload, _ := json.Marshal(map[string]string{
 			"conversation_id": conv.ID,
 			"message_id":      msgID,
-			"sent_by":         req.SentBy,
+			"sent_by":         actor,
 		})
 		if err := s.Agentkit.AppendEvent(ctx, agentkit.Event{
 			ID:        agentkit.NewID(),
@@ -103,7 +130,7 @@ func (s *Server) handleDispatcherReply(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	writeJSON(w, http.StatusAccepted, map[string]string{
+	writeJSON(w, http.StatusOK, map[string]string{
 		"status":     "sent",
 		"message_id": msgID,
 	})

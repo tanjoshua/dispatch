@@ -34,6 +34,7 @@ func New(tc temporalclient.Client, pool *pgxpool.Pool, model string, llmClient l
 		Agents: map[string]temporalkit.AgentDefinition{
 			def.Name: def,
 		},
+		ActionContext: appStore.ActionContext,
 		// A tripped turn budget means the agent was acting without a human in
 		// the path; flag the conversation so a dispatcher engages (the same
 		// attention projection + notification path the escalate tool uses).

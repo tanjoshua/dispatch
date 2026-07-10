@@ -17,12 +17,13 @@ import (
 func TestIntakePolicyRouting(t *testing.T) {
 	policy := Definition("test-model", nil, nil, nil).Policy
 	cases := map[string]agentkit.PolicyDecision{
-		"update_case":   agentkit.AutoApprove,
-		"continue_case": agentkit.AutoApprove, // record-keeping, same footing as update_case
-		"escalate":      agentkit.AutoApprove, // raising an alarm needs no permission
-		"send_message":  agentkit.RequireApproval,
-		"close_case":    agentkit.RequireApproval,
-		"unknown_tool":  agentkit.RequireApproval, // default is the safe one
+		"list_candidate_cases": agentkit.AutoApprove,
+		"select_case":          agentkit.AutoApprove,
+		"create_case":          agentkit.AutoApprove,
+		"update_case":          agentkit.AutoApprove,
+		"escalate":             agentkit.AutoApprove,
+		"propose_response":     agentkit.RequireApproval,
+		"unknown_tool":         agentkit.RequireApproval, // default is the safe one
 	}
 	for tool, want := range cases {
 		if got := policy.Evaluate(context.Background(), agentkit.Action{Tool: tool}); got != want {
@@ -37,7 +38,7 @@ func TestIntakePolicyRouting(t *testing.T) {
 // a *revised* customer reply — not repeat, not yield.
 func TestScriptedRevisesAfterRejection(t *testing.T) {
 	rejected := agentkit.Action{
-		Tool:     "send_message",
+		Tool:     "propose_response",
 		State:    agentkit.ActionRejected,
 		Decision: &agentkit.Decision{Kind: agentkit.DecisionReject, Reason: "Too formal — be warmer"},
 	}
@@ -46,7 +47,7 @@ func TestScriptedRevisesAfterRejection(t *testing.T) {
 
 	msgs := []llm.Message{
 		llm.UserText("My kitchen sink is leaking"),
-		assistantToolUse(t, "call-a", "send_message", map[string]any{
+		assistantToolUse(t, "call-a", "propose_response", map[string]any{
 			"message": "Thanks for reaching out! Could I get your name and address?",
 		}),
 		llm.ToolResults(llm.ToolResult{ToolCallID: "call-a", Content: feedbackContent}),
@@ -57,8 +58,8 @@ func TestScriptedRevisesAfterRejection(t *testing.T) {
 		t.Fatalf("Complete: %v", err)
 	}
 	calls := resp.ToolCalls()
-	if len(calls) != 1 || calls[0].Name != "send_message" {
-		t.Fatalf("after rejection want one send_message, got %+v", calls)
+	if len(calls) != 1 || calls[0].Name != "propose_response" {
+		t.Fatalf("after rejection want one propose_response, got %+v", calls)
 	}
 	var out struct {
 		Message string `json:"message"`
@@ -79,7 +80,7 @@ func TestScriptedRevisesAfterRejection(t *testing.T) {
 func TestScriptedYieldsAfterApproval(t *testing.T) {
 	msgs := []llm.Message{
 		llm.UserText("My kitchen sink is leaking"),
-		assistantToolUse(t, "call-a", "send_message", map[string]any{
+		assistantToolUse(t, "call-a", "propose_response", map[string]any{
 			"message": "Got it — what's the service address?",
 		}),
 		llm.ToolResults(llm.ToolResult{ToolCallID: "call-a", Content: `{"status":"sent"}`}),

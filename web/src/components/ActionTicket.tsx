@@ -94,7 +94,7 @@ function RawPayload({ label, value }: { label: string; value: unknown }) {
 // tickets are fully expanded and carry the decision keys; decided tickets
 // collapse to one audit line, with the full record (original proposal,
 // edits, decision, result) behind the chevron.
-export function ActionTicket({ action }: { action: Action }) {
+export function ActionTicket({ action, contextRevision }: { action: Action; contextRevision: number }) {
   const qc = useQueryClient()
   const [mode, setMode] = useState<'idle' | 'edit' | 'reject'>('idle')
   const [draft, setDraft] = useState('')
@@ -218,7 +218,7 @@ export function ActionTicket({ action }: { action: Action }) {
           <div className="flex gap-2">
             <Button
               size="sm"
-              onClick={() => decide.mutate({ actionId: action.id, kind: 'approve' })}
+			  onClick={() => decide.mutate({ actionId: action.id, expectedActionVersion: action.version, expectedContextRevision: contextRevision, kind: 'approve' })}
               disabled={decide.isPending}
             >
               {decide.isPending && <Spinner data-icon="inline-start" />}
@@ -257,8 +257,10 @@ export function ActionTicket({ action }: { action: Action }) {
                 onClick={() => {
                   try {
                     const parsed = JSON.parse(draft)
-                    decide.mutate({
-                      actionId: action.id,
+                  decide.mutate({
+                    actionId: action.id,
+					expectedActionVersion: action.version,
+					expectedContextRevision: contextRevision,
                       kind: 'approve_with_edits',
                       editedInput: parsed,
                     })
@@ -290,7 +292,7 @@ export function ActionTicket({ action }: { action: Action }) {
                 size="sm"
                 variant="destructive"
                 onClick={() =>
-                  reason.trim() && decide.mutate({ actionId: action.id, kind: 'reject', reason })
+				  reason.trim() && decide.mutate({ actionId: action.id, expectedActionVersion: action.version, expectedContextRevision: contextRevision, kind: 'reject', reason })
                 }
                 disabled={decide.isPending || !reason.trim()}
               >

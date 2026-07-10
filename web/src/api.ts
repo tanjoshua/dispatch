@@ -10,6 +10,7 @@ export type ActionState =
   | 'executing'
   | 'completed'
   | 'failed'
+  | 'superseded'
 
 export type DecisionKind =
   | 'approve'
@@ -50,6 +51,9 @@ export interface Action {
   proposed_at: string
   decided_at?: string
   executed_at?: string
+	version: number
+	context_revision: number
+	responds_through_event_seq?: number
 }
 
 // Customer is the CRM aggregate. Contact endpoints (phone, email) live on
@@ -66,6 +70,9 @@ export interface Conversation {
   id: string
   customer_id: string
   channel_id: string
+	contact_identity_id: string
+	event_seq: number
+	context_revision: number
   status: 'open' | 'closed'
   attention_state: AttentionState
   attention_reason?: string
@@ -83,6 +90,8 @@ export interface Message {
   author: MessageAuthor
   body: string
   created_at: string
+	event_seq?: number
+	delivery_state: 'queued' | 'sending' | 'sent' | 'failed' | 'unknown'
 }
 
 // Case is the unit of work — the generalization of a field-service "job"
@@ -96,6 +105,8 @@ export interface Case {
   status: 'intake' | 'intake_complete'
   data: Record<string, string>
   updated_at: string
+	version: number
+	summary: string
 }
 
 export interface Run {
@@ -121,6 +132,8 @@ export interface ConversationDetail {
   contact: string // customer's address on this thread's channel (design/004 §3)
   messages: Message[] | null
   case?: Case
+	candidate_cases: Case[]
+	current_draft?: Action
   run?: Run
   actions: Action[] | null
 }
@@ -177,12 +190,12 @@ export function sendInbound(input: { phone: string; name: string; text: string }
 // sendDispatcherReply posts a message the dispatcher types straight to the
 // customer — a first-class participant reply, not an agent action
 // (design/003-dispatcher-as-participant.md).
-export function sendDispatcherReply(input: { conversationId: string; text: string }) {
+export function sendDispatcherReply(input: { conversationId: string; text: string; expectedContextRevision: number; commandId: string }) {
   return request<{ status: string; message_id: string }>(
     `/api/conversations/${input.conversationId}/reply`,
     {
       method: 'POST',
-      body: JSON.stringify({ text: input.text, sent_by: 'dispatcher' }),
+	  body: JSON.stringify({ text: input.text, command_id: input.commandId, expected_context_revision: input.expectedContextRevision }),
     },
   )
 }
@@ -197,8 +210,14 @@ export function acknowledgeEscalation(input: { conversationId: string; note?: st
   )
 }
 
+export function correctCase(input: { conversationId: string; caseRecord: Case; patch: Record<string,string>; sourceMessageIds: string[] }) {
+	return request<Case>(`/api/conversations/${input.conversationId}/cases/${input.caseRecord.id}/correction`, {method:'POST',body:JSON.stringify({expected_version:input.caseRecord.version,patch:input.patch,source_message_ids:input.sourceMessageIds})})
+}
+
 export function decideAction(input: {
   actionId: string
+	expectedActionVersion: number
+	expectedContextRevision: number
   kind: DecisionKind
   editedInput?: unknown
   reason?: string
@@ -206,10 +225,12 @@ export function decideAction(input: {
   return request<{ status: string }>(`/api/actions/${input.actionId}/decision`, {
     method: 'POST',
     body: JSON.stringify({
+	  decision_id: crypto.randomUUID(),
+	  expected_action_version: input.expectedActionVersion,
+	  expected_context_revision: input.expectedContextRevision,
       kind: input.kind,
       edited_input: input.editedInput,
       reason: input.reason,
-      decided_by: 'dispatcher',
     }),
   })
 }

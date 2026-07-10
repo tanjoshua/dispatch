@@ -2,17 +2,21 @@ package server
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 
 	"dispatch/agentkit"
+	akstore "dispatch/agentkit/store"
 	"dispatch/agentkit/temporalkit"
 )
 
 type decisionRequest struct {
-	Kind        agentkit.DecisionKind `json:"kind"` // approve | approve_with_edits | reject | dismiss
-	EditedInput json.RawMessage       `json:"edited_input,omitempty"`
-	Reason      string                `json:"reason,omitempty"`
-	DecidedBy   string                `json:"decided_by,omitempty"`
+	DecisionID              string                `json:"decision_id"`
+	ExpectedActionVersion   int64                 `json:"expected_action_version"`
+	ExpectedContextRevision int64                 `json:"expected_context_revision"`
+	Kind                    agentkit.DecisionKind `json:"kind"` // approve | approve_with_edits | reject | dismiss
+	EditedInput             json.RawMessage       `json:"edited_input,omitempty"`
+	Reason                  string                `json:"reason,omitempty"`
 }
 
 // handleDecision validates a human decision and signals the run's workflow.
@@ -25,6 +29,10 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 	var req decisionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.DecisionID == "" || req.ExpectedActionVersion < 1 || req.ExpectedContextRevision < 0 {
+		writeError(w, http.StatusBadRequest, "decision_id and expected versions are required")
 		return
 	}
 
@@ -69,8 +77,31 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if action.State != agentkit.ActionPendingApproval {
-		writeError(w, http.StatusConflict, "action is not pending approval (state: "+string(action.State)+")")
+	actorProvider := s.ActorProvider
+	if actorProvider == nil {
+		actorProvider = StaticActorProvider("dispatcher:dev")
+	}
+	actor, err := actorProvider.ActorID(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "actor unavailable")
+		return
+	}
+	action, _, err = s.Agentkit.DecideAction(ctx, akstore.DecisionCommand{ID: req.DecisionID, OrgID: s.DefaultOrgID, ActionID: actionID,
+		ExpectedActionVersion: req.ExpectedActionVersion, ExpectedContextRevision: req.ExpectedContextRevision,
+		Decision: agentkit.Decision{Kind: req.Kind, DecidedBy: actor, Reason: req.Reason}, EditedInput: req.EditedInput})
+	if err != nil {
+		code := "version_conflict"
+		if errors.Is(err, akstore.ErrStaleAction) {
+			code = "stale_action"
+		}
+		if errors.Is(err, akstore.ErrAlreadyResolved) {
+			code = "already_resolved"
+		}
+		if errors.Is(err, akstore.ErrStaleAction) || errors.Is(err, akstore.ErrAlreadyResolved) || errors.Is(err, akstore.ErrVersionConflict) {
+			writeJSON(w, http.StatusConflict, map[string]any{"error": code, "code": code, "current_action": action})
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
 
@@ -79,7 +110,7 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 		temporalkit.DecisionSignal{
 			ActionID:    action.ID,
 			Kind:        req.Kind,
-			DecidedBy:   req.DecidedBy,
+			DecidedBy:   actor,
 			EditedInput: req.EditedInput,
 			Reason:      req.Reason,
 		})
@@ -87,5 +118,5 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, "signal workflow: "+err.Error())
 		return
 	}
-	writeJSON(w, http.StatusAccepted, map[string]string{"status": "decision_sent", "action_id": action.ID})
+	writeJSON(w, http.StatusOK, map[string]any{"status": "recorded", "action": action})
 }

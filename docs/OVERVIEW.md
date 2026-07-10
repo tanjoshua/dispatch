@@ -73,7 +73,7 @@ Organization
  │                      default_playbook_id — where inbound routing binds
  ├─ Customer            CRM aggregate (person/business)
  │   └─ ContactIdentity (channel_kind, address) — one customer, many
- ├─ Conversation        ONE persistent thread per (customer × connection);
+ ├─ Conversation        ONE persistent thread per (contact identity × connection);
  │   └─ Message         never auto-closed; carries attention_state
  │                      (escalation projection) and author per message
  │                      (customer | agent | dispatcher)
@@ -90,8 +90,9 @@ Key cardinality decisions (these replaced the v1 1:1 chain):
   `(kind, address) → ContactIdentity → Customer`; same person across channels
   is one customer. Identity merge/dedup is a deferred follow-up.
 - **Thread ≠ case lifecycle.** Threads persist forever; the *case* carries
-  "is this work done". One thread per (customer, channel) — the customer
-  view, not the thread, unifies channels.
+  "is this work done". A thread is bound to the exact contact identity used on
+  a channel connection; the customer view, not the thread, unifies identities
+  and channels. Replies route through that same identity.
 - **Run ≠ conversation.** Runs come and go per task; a thread has many, at
   most one awaiting customer input. `run_bindings` keeps agentkit's `runs`
   table business-agnostic.
@@ -102,7 +103,9 @@ Key cardinality decisions (these replaced the v1 1:1 chain):
 ## 4. The agent loop
 
 One Temporal workflow per run (`run-{runID}`), signals `inbound_message`,
-`decision`, `dispatcher_message`. All non-determinism (LLM, DB, tool
+`decision`, `dispatcher_message`. This remains the active workflow while the
+conversation-coordinator cutover described below is completed. All
+non-determinism (LLM, DB, tool
 execution, IDs) lives in activities; projections are idempotent via
 `(run_id, dedupe_key)` on events and conditional updates on actions.
 
@@ -114,8 +117,9 @@ for run is open:
         loop (≤ MaxLLMCallsPerTurn, exceed → record + app hook → human):
             LLM turn (Complete flushes the delta to the Postgres transcript,
                       assembles context there, records usage) →
-            for each tool call:
-              ProposeAction → Policy.Evaluate
+            enforce one effectful tool call per completion
+            for each permitted tool call:
+              ProposeAction (with context + dependency versions) → Policy.Evaluate
                 → auto-approve | Forbid | durable wait for decision signal
               approved → validate input vs schema → ExecuteAction
                          (the ONLY place a tool runs)
@@ -126,14 +130,19 @@ for run is open:
 ```
 
 - **Action lifecycle:** `proposed → pending_approval → approved /
-  approved_with_edits / rejected → executing → completed / failed`. Decision
+  approved_with_edits / rejected / superseded → executing → completed /
+  failed`. Decision
   kinds: `approve`, `approve_with_edits`, `reject` (reason required, fed back),
   `dismiss` (escape: agent stands down, waits for next customer message),
-  `supersede` (dispatcher answered the customer directly while a draft was
-  pending — the workflow records it, not the review endpoint).
+  `supersede` (a dispatcher reply or newer inbound message invalidated the
+  pending draft). Superseded proposals are retained as history, never treated
+  as the current response.
 - **Dispatcher as participant:** the dispatcher can reply to the customer at
   any time (`POST /api/conversations/{id}/reply`), out the same shared Sender
-  path, recorded as an event and signaled into the run as labeled context.
+  path. The API records queued delivery intent before attempting delivery and
+  signals the run as labeled context. Decisions are synchronously persisted,
+  actor-attributed, command-idempotent compare-and-set operations; the workflow
+  signal wakes execution after the decision is already durable.
   There is no takeover mode and no "agent's turn".
 - **Escalation is orthogonal to approval:** the auto-approved `escalate` tool
   answers "should a human engage *now*" (per conversation), never "should this
@@ -143,8 +152,42 @@ for run is open:
 
 ## 5. What is implemented (verified end-to-end)
 
+### Residential-first correctness cutover (2026-07-10)
+
+- Conversations bind to an exact `contact_identity_id` and are unique by
+  `(org_id, channel_id, contact_identity_id)`. Outbound routing uses that exact
+  identity. Customers, cases, and playbooks carry versions; cases also carry a
+  durable summary.
+- Inbound persistence is ordered by `event_seq` and `context_revision`. One
+  transaction inserts the message and `conversation_event`, advances the
+  cursor, supersedes a pending response, and writes a workflow-wakeup outbox
+  row. Provider duplicates do not advance either cursor.
+- Agent case handling is explicit: customer-wide candidate listing, explicit
+  selection, explicit creation, and compare-and-set updates with exact source
+  message IDs. The prompt and tools no longer select or reopen the latest case.
+- Proposed actions carry action/context versions and customer/case/playbook
+  dependency versions. Inbound wakes a workflow even while it is waiting on a
+  draft, supersedes that draft, and replans. The loop rejects mixed or multiple
+  effectful calls without executing any of them and uses an eight-completion
+  turn budget.
+- Dispatcher decisions are synchronous, actor-attributed by an
+  `ActorProvider`, command-idempotent, and compare action/context versions
+  under the conversation lock. Dispatcher replies use the same revision
+  contract, persist queued delivery intent first, and expose delivery state.
+- The detail API exposes exact identity, selected case, customer-wide candidate
+  cases, current draft, superseded history, revisions, and delivery state. The
+  UI renders one current response draft, case candidates, case corrections,
+  conflict-safe decisions/replies, and blocked delivery states.
+
+The migration also creates the durable seams for the remaining coordinator
+cutover: `outbox`, `context_snapshots`, and `model_turns`. The active Temporal
+workflow is still the legacy run-scoped loop; replacing it with
+`ConversationCoordinatorV2`, processing outbox rows independently of the HTTP
+process, persisting per-turn snapshots/model requests, and performing
+delivery-dependent run completion remain the next implementation slice.
+
 - **Infra:** docker-compose (Postgres 16 + Temporal dev server), `cmd/migrate`
-  (10 migrations), `cmd/server` (JSON API :8080), `cmd/worker`. ULIDs
+  (11 migrations), `cmd/server` (JSON API :8080), `cmd/worker`. ULIDs
   everywhere; `org_id` on every table (seeded `org_dev`, `chan_dev`,
   `pb_field_service`).
 - **agentkit:** full Action state machine with idempotent Postgres store;
@@ -156,23 +199,21 @@ for run is open:
   provider-agnostic LLM interface + Anthropic adapter (default
   `claude-opus-4-8`; unmodeled schema keywords pass through); temporalkit
   agent loop as above.
-- **Intake agent (the one pack):** `send_message` + `close_case` require
-  approval; `update_case` + `continue_case` + `escalate` auto-approved.
-  `update_case` routes `customer_name` to the Customer and merges the rest
-  into the case data bag (schema-constrained, no arbitrary keys). Triage:
-  a fresh run on a thread with a prior case binds as `task_kind='triage'`,
-  gets a briefing (customer + rolling thread summary + latest case + recent
-  message window) via the per-run `SystemContext` seam, and can continue the
-  prior case (`continue_case`), answer, or open a new one; `close_case` may
-  complete a case-less run and rolls its approved summary into the thread's
-  `thread_summary`. `DISPATCH_FAKE_LLM=1` scripted LLM for keyless demos/e2e.
+- **Intake agent (the one pack):** case resolution is explicit through
+  `list_candidate_cases`, `select_case`, and `create_case`; `update_case`
+  compare-and-sets the selected case with exact source-message provenance.
+  `propose_response` is the single reviewed customer-facing unit and may carry
+  delivery-dependent completion instructions. `escalate`, `stand_down`, and
+  `wait_for_external` stop or pause work without pretending a customer message
+  or external notification was sent. A fresh run receives customer, rolling
+  summary, candidate-case, and recent-message context through `SystemContext`.
+  `DISPATCH_FAKE_LLM=1` provides a scripted LLM for keyless demos/e2e.
 - **Channels:** kind = code (`Adapter`), connection = data. Shared `Sender`
-  (outbound; message ID derived from action ID = delivery idempotency key) and
-  `Router` (inbound: identity → thread → message insert deduped on
-  `provider_message_id` → playbook → live-run claim under a conversation lock
-  → signal-with-start; the workflow dedupes signals by message ID). One thread
-  per (customer, channel) and identity creation are constraint-backed. The dev
-  channel exercises the full production path.
+  persists delivery state and uses the action/message ID as its idempotency
+  key. `Router` resolves an exact identity and transactionally inserts the
+  deduped inbound message and conversation event, advances sequence/revision,
+  supersedes the current draft, and enqueues workflow wakeup. Identity-bound
+  thread creation is constraint-backed. The dev channel exercises this path.
 - **API:** `POST /api/dev/inbound`, `GET /api/conversations[/{id}]`,
   `POST /api/actions/{id}/decision`, `POST /api/conversations/{id}/reply`,
   `POST /api/conversations/{id}/acknowledge`, `GET /api/runs/{id}/events`,
@@ -186,92 +227,61 @@ for run is open:
   restart mid-run resumes with pending action intact; persistent threads with
   run/case per task; playbook-driven agent + case-type selection; duplicate
   webhook delivery resolves to one message row and one agent turn; intake →
-  close_case → follow-up produces a briefed triage run; out-of-schema human
+  delivery-confirmed completion → follow-up produces a briefed run; out-of-schema human
   edits fail validation and are fed back; transcripts persist per turn with
   workflow inputs reduced to counters.
 
 Older decisions that still stand and their why, in brief: Temporal over a
 hand-rolled state machine (durable multi-day waits are the hard part); UI
-reads Postgres projections, never workflow queries; signals over Temporal
-updates (revisit if decisions need synchronous validation); provider-agnostic
-LLM interface kept to the tool-calling intersection; React SPA with the JSON
-API as the contract.
+reads Postgres projections, never workflow queries; provider-agnostic LLM
+interface kept to the tool-calling intersection; React SPA with the JSON API
+as the contract.
 
 ## 6. Gaps to tackle next
 
-From an adversarial review of the implementation (2026-07-09). Numbering is
-stable — code comments cite these numbers — so resolved items are ledgered,
-not renumbered.
-
-**Resolved 2026-07-10** (one commit each; details in git history): #1
-idempotent outbound sends, #2 inbound dedupe + one live run per thread, #3
-transcripts in Postgres, #5 input validation at ExecuteAction, #6 usage
-logging + loop budget, #11 triage runs with briefing, #14 pending-age +
-per-tool decision rates, and hydration's first tiers (§6.4: profile + rolling
-summary + recent window via the `SystemContext` seam).
-
-Known accepted races (documented, deliberately unfixed): a webhook retry that
-arrives *after* the original message's run already completed can spawn a
-spurious triage run (it gets a briefing, so it degrades gracefully); a
-customer message landing in the exact window where a terminal `close_case`
-executes stays buffered in a workflow that then returns — the message is
-persisted on the thread but no run processes it until the customer's next
-message. Both are narrow; revisit with decision timeouts.
+The 2026-07-10 correctness cutover retires the earlier itemized race ledger.
+The remaining work is grouped by the boundary it completes.
 
 ### 6.1 Correctness / durability
 
-4. **Decision signals can be silently dropped.** A decision arriving for a
-   non-pending action (supersede race, second dispatcher) is consumed and
-   discarded with a log line after the API already returned 202. At minimum
-   record dropped decisions as events; better, make 202 mean "recorded".
+1. **Finish the coordinator cutover.** Activate `ConversationCoordinatorV2`,
+   drain outbox wakeups independently of the HTTP process, persist context
+   snapshots and model turns, and make run completion depend on confirmed
+   delivery. The schema seams exist; the active workflow is still run-scoped.
+2. **Prove replay and race behavior.** Add Temporal tests for inbound arriving
+   during review, duplicate decisions/replies, supersession, delivery failure,
+   workflow replay, and outbox retries. These invariants are the product.
 
 ### 6.2 Trust boundary
 
-7. **Dispatcher impersonation via message text.** Dispatcher notes are a
+3. **Dispatcher impersonation via message text.** Dispatcher notes are a
    plain-text label inside a user turn; a customer typing the same label
    spoofs the dispatcher in the agent's context. Harmless while every
-   `send_message` is reviewed; a live hole once anything auto-sends. Fix
+   `propose_response` is reviewed; a live hole once anything auto-sends. Fix
    structurally (delimit/escape customer text), not by prompt. (The briefing
    assembled by `app/briefing` labels message text as data — same treatment
    belongs on live turns.)
-8. **Auto-approved tools are still an injection surface.** `SetCustomerName`
-   unconditionally overwrites the CRM name (the identity-create path
-   deliberately only fills blanks — make them agree); `escalate` has no rate
-   limit (pager DoS). update_case's arbitrary-keys hole is closed (#5). Keep
-   auto-approve, narrow the writes.
-9. **`decided_by` is client-asserted** in the audit trail that *is* the
-   product. Auth is a known non-goal for now, but when it lands, the decision
-   path is its first consumer — not just reads.
-10. **Org scoping is on tables, not queries.** Every by-ID read
+4. **Org scoping is on tables, not queries.** Every by-ID read
     (conversation, action, run, events) skips `org_id`; each new endpoint
     copies the pattern and the retrofit bill grows. Move store signatures to
     `(ctx, orgID, id)` now. (Also: CORS `*` is dev-only; don't ship it.)
 
 ### 6.3 Product gaps
 
-12. **The dispatcher can't correct the case record.** `update_case` never
-    surfaces for review (auto-approved) and the UI has no case editing — a
-    wrong address has no human fix path. Case edits are also training-data
-    signal the product thesis wants captured.
-13. **Escalation has no notification path.** The tool description tells the
-    model "this pages the dispatcher" — it only sorts a list in a UI nobody
-    may have open, and the model calibrates its safety behavior on that
-    claim. Build a real notification (webhook/email is enough) or make the
-    description honest, before any pilot. The turn-budget hook (#6) now
-    reuses the same attention projection — a notification path serves both.
-15. **Conversation-list endpoint is N+1×4** (full `ListMessages` per
+5. **Escalation has no notification path.** The agent now accurately says that
+   escalation only flags the queue and stands down. Add webhook/email paging
+   before relying on it for unattended safety response.
+6. **Conversation-list endpoint is N+1×4** (full `ListMessages` per
     conversation for a last-message preview plus per-row action scans),
     polled by every client. One query with lateral joins.
-16. **Test coverage doesn't match the claims.** Unit tests cover policy
-    routing, rejection-feedback recognition, and schema validation, but
-    nothing covers action-state-machine idempotency under retries, the
-    supersede/dismiss/decision races, or workflow replay (Temporal
-    `testsuite` exists for exactly this). The pipeline is the product.
+7. **Identity merge and verified profile editing are incomplete.** Exact
+   routing is safe, and dispatchers can correct case data, but customer-level
+   identity merge/dedup and audited profile correction remain product work.
 
 ### 6.4 Designed but not built
 
 - **Hydration upgrades:** the rolling thread summary is currently the
-  dispatcher-approved `close_case` summary line (cheap, human-reviewed); an
+  dispatcher-approved response-completion summary line (cheap, human-reviewed); an
   LLM-generated summary can replace it behind the same
   `conversations.thread_summary` column when threads outgrow five lines.
 - **Pack SDK + second vertical** (was the future design 006): playbook
@@ -292,15 +302,12 @@ message. Both are narrow; revisit with decision timeouts.
 
 ### Suggested sequence
 
-1. #13 (real escalation notification) — before any pilot; the model's safety
-   behavior is calibrated on the tool description being true.
-2. #7 + #8 (delimit customer text; narrow SetCustomerName; rate-limit
-   escalate) — the trust-boundary trio, small and mostly mechanical.
-3. #4 (record dropped decisions as events).
-4. #10 (org-scoped store reads) + #16 (pipeline tests) — hygiene that gets
-   more expensive every week it waits.
-5. #15 (list-endpoint query), #12 (case editing in the UI).
+1. Finish the coordinator/outbox/model-turn cutover and its replay/race tests.
+2. Delimit untrusted message text and complete org-scoped reads.
+3. Add real escalation notification before an unattended pilot.
+4. Remove the conversation-list N+1 queries; then build identity merge and
+   audited customer-profile editing.
 
-The WhatsApp adapter is unblocked from the durability side (#1/#2/#3 done);
-it should land after 1–2 above so escalation and the trust boundary are
-honest before real customers hit them.
+The WhatsApp adapter is unblocked from the persistence side, but should follow
+the coordinator tests and real escalation notification before live customers
+depend on it.

@@ -47,12 +47,13 @@ func main() {
 	akStore := akstore.NewPostgres(pool)
 	sender := channel.NewSender(domainStore, channel.NewRegistry(dev.New(domainStore)))
 	srv := &server.Server{
-		Domain:       domainStore,
-		Agentkit:     akStore,
-		Temporal:     tc,
-		Router:       channel.NewRouter(domainStore, akStore, tc, app.TaskQueue, intake.AgentName),
-		Sender:       sender,
-		DefaultOrgID: app.OrgID,
+		Domain:        domainStore,
+		Agentkit:      akStore,
+		Temporal:      tc,
+		Router:        channel.NewRouter(domainStore, akStore, tc, app.TaskQueue, intake.AgentName),
+		Sender:        sender,
+		DefaultOrgID:  app.OrgID,
+		ActorProvider: server.StaticActorProvider(env("DISPATCH_DEV_ACTOR", "dispatcher:dev")),
 	}
 
 	log.Printf("api server listening on :%s", port)

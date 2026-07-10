@@ -127,7 +127,7 @@ export function SupersededDraft({ action }: { action: Action }) {
 // A send_message proposal is a message the business hasn't sent yet, so it
 // reads like one: an outbound bubble in the thread — dashed while it's a
 // draft — with the decision keys underneath instead of a ticket card.
-export function AgentDraft({ action }: { action: Action }) {
+export function AgentDraft({ action, contextRevision }: { action: Action; contextRevision: number }) {
   const qc = useQueryClient()
   const [mode, setMode] = useState<'idle' | 'edit' | 'revise'>('idle')
   const [draft, setDraft] = useState('')
@@ -175,7 +175,7 @@ export function AgentDraft({ action }: { action: Action }) {
                 <button
                   type="button"
                   title="Dismiss this draft — the agent drafts again when the customer replies"
-                  onClick={() => decide.mutate({ actionId: action.id, kind: 'dismiss' })}
+				  onClick={() => decide.mutate({ actionId: action.id, expectedActionVersion: action.version, expectedContextRevision: contextRevision, kind: 'dismiss' })}
                   disabled={decide.isPending}
                   className="ml-auto -mr-1 rounded p-0.5 text-signal/50 transition-colors hover:bg-signal/10 hover:text-signal disabled:opacity-50"
                 >
@@ -203,6 +203,8 @@ export function AgentDraft({ action }: { action: Action }) {
                       draft.trim() &&
                       decide.mutate({
                         actionId: action.id,
+						expectedActionVersion: action.version,
+						expectedContextRevision: contextRevision,
                         kind: 'approve_with_edits',
                         editedInput: {
                           ...(action.input as Record<string, unknown>),
@@ -245,7 +247,7 @@ export function AgentDraft({ action }: { action: Action }) {
               </Button>
               <Button
                 size="sm"
-                onClick={() => decide.mutate({ actionId: action.id, kind: 'approve' })}
+				onClick={() => decide.mutate({ actionId: action.id, expectedActionVersion: action.version, expectedContextRevision: contextRevision, kind: 'approve' })}
                 disabled={decide.isPending}
               >
                 {decide.isPending && <Spinner data-icon="inline-start" />}
@@ -272,7 +274,7 @@ export function AgentDraft({ action }: { action: Action }) {
                   size="sm"
                   onClick={() =>
                     reason.trim() &&
-                    decide.mutate({ actionId: action.id, kind: 'reject', reason })
+					decide.mutate({ actionId: action.id, expectedActionVersion: action.version, expectedContextRevision: contextRevision, kind: 'reject', reason })
                   }
                   disabled={decide.isPending || !reason.trim()}
                 >

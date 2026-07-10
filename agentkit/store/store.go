@@ -9,6 +9,7 @@ package store
 import (
 	"context"
 	"encoding/json"
+	"errors"
 
 	"dispatch/agentkit"
 	"dispatch/agentkit/llm"
@@ -35,6 +36,9 @@ type Store interface {
 	// the decision_made event. If the action is already decided, the stored
 	// action is returned unchanged.
 	RecordDecision(ctx context.Context, actionID string, decision agentkit.Decision, editedInput json.RawMessage, event agentkit.Event) (*agentkit.Action, error)
+	// DecideAction synchronously compare-and-sets a dispatcher command under
+	// the conversation lock. Duplicate command IDs return the original result.
+	DecideAction(ctx context.Context, cmd DecisionCommand) (*agentkit.Action, bool, error)
 	// FinishAction records an execution result (or failure) and appends the
 	// corresponding event. Already-finished actions are returned unchanged.
 	FinishAction(ctx context.Context, actionID string, result json.RawMessage, execErr string, event agentkit.Event) (*agentkit.Action, error)
@@ -62,3 +66,17 @@ type Store interface {
 	// GetRunMessage returns the message at seq, or ok=false if absent.
 	GetRunMessage(ctx context.Context, runID string, seq int) (msg *llm.Message, ok bool, err error)
 }
+
+type DecisionCommand struct {
+	ID                      string
+	OrgID                   string
+	ActionID                string
+	ExpectedActionVersion   int64
+	ExpectedContextRevision int64
+	Decision                agentkit.Decision
+	EditedInput             json.RawMessage
+}
+
+var ErrStaleAction = errors.New("agentkit/store: stale action")
+var ErrAlreadyResolved = errors.New("agentkit/store: already resolved")
+var ErrVersionConflict = errors.New("agentkit/store: version conflict")

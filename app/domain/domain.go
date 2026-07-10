@@ -46,6 +46,7 @@ type Playbook struct {
 	Agent     string          `json:"agent"`     // names a code-registered agent definition
 	CaseType  string          `json:"case_type"` // the case type this playbook produces
 	Config    json.RawMessage `json:"config,omitempty"`
+	Version   int64           `json:"version"`
 	CreatedAt time.Time       `json:"created_at"`
 }
 
@@ -56,6 +57,7 @@ type Customer struct {
 	ID        string    `json:"id"`
 	OrgID     string    `json:"org_id"`
 	Name      string    `json:"name"`
+	Version   int64     `json:"version"`
 	CreatedAt time.Time `json:"created_at"`
 }
 
@@ -98,14 +100,17 @@ const (
 // task bound to the thread in run_bindings, and a thread can have many over its
 // life. Status stays for a future archive state; threads are never auto-closed.
 type Conversation struct {
-	ID              string             `json:"id"`
-	OrgID           string             `json:"org_id"`
-	CustomerID      string             `json:"customer_id"`
-	ChannelID       string             `json:"channel_id"` // the connection this conversation belongs to
-	Status          ConversationStatus `json:"status"`
-	AttentionState  AttentionState     `json:"attention_state"`
-	AttentionReason string             `json:"attention_reason,omitempty"`
-	EscalatedAt     *time.Time         `json:"escalated_at,omitempty"`
+	ID                string             `json:"id"`
+	OrgID             string             `json:"org_id"`
+	CustomerID        string             `json:"customer_id"`
+	ChannelID         string             `json:"channel_id"` // the connection this conversation belongs to
+	ContactIdentityID string             `json:"contact_identity_id"`
+	EventSeq          int64              `json:"event_seq"`
+	ContextRevision   int64              `json:"context_revision"`
+	Status            ConversationStatus `json:"status"`
+	AttentionState    AttentionState     `json:"attention_state"`
+	AttentionReason   string             `json:"attention_reason,omitempty"`
+	EscalatedAt       *time.Time         `json:"escalated_at,omitempty"`
 	// ThreadSummary is the rolling record of what past tasks on this thread
 	// were about: one dated line per completed task, taken from the
 	// dispatcher-approved close_case summary. Briefings feed it to fresh runs
@@ -143,9 +148,23 @@ type Message struct {
 	// ProviderMessageID is the transport's own ID for an inbound message (a
 	// WhatsApp wamid, etc.) — the dedupe key under webhook retries and provider
 	// duplicates. Empty on outbound messages and on channels without one (dev).
-	ProviderMessageID string    `json:"provider_message_id,omitempty"`
-	CreatedAt         time.Time `json:"created_at"`
+	ProviderMessageID  string        `json:"provider_message_id,omitempty"`
+	EventSeq           int64         `json:"event_seq,omitempty"`
+	DeliveryState      DeliveryState `json:"delivery_state"`
+	ProviderDeliveryID string        `json:"provider_delivery_id,omitempty"`
+	DeliveryError      string        `json:"delivery_error,omitempty"`
+	CreatedAt          time.Time     `json:"created_at"`
 }
+
+type DeliveryState string
+
+const (
+	DeliveryQueued  DeliveryState = "queued"
+	DeliverySending DeliveryState = "sending"
+	DeliverySent    DeliveryState = "sent"
+	DeliveryFailed  DeliveryState = "failed"
+	DeliveryUnknown DeliveryState = "unknown"
+)
 
 type CaseStatus string
 
@@ -168,6 +187,8 @@ type Case struct {
 	ConversationID string          `json:"conversation_id"`
 	Type           string          `json:"type"` // "field_service_job" — the playbook's case type
 	Status         CaseStatus      `json:"status"`
+	Version        int64           `json:"version"`
+	Summary        string          `json:"summary"`
 	Data           json.RawMessage `json:"data"` // per-vertical fields; schema owned by the playbook
 	CreatedAt      time.Time       `json:"created_at"`
 	UpdatedAt      time.Time       `json:"updated_at"`

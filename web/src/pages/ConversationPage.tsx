@@ -80,7 +80,7 @@ const UNSENT_DRAFT_STATES = new Set<Action['state']>([
 
 function isUnsentDraft(action: Action): boolean {
   return (
-    action.tool === 'send_message' &&
+	(action.tool === 'send_message' || action.tool === 'propose_response') &&
     draftText(action) != null &&
     UNSENT_DRAFT_STATES.has(action.state)
   )
@@ -111,7 +111,7 @@ function buildTimeline(messages: Message[], actions: Action[]): TimelineItem[] {
 // text so the bubble can wear that provenance.
 function matchSentActions(messages: Message[], actions: Action[]): Map<string, Action> {
   const sends = actions
-    .filter((a) => a.tool === 'send_message' && a.state === 'completed')
+	.filter((a) => (a.tool === 'send_message' || a.tool === 'propose_response') && a.state === 'completed')
     .sort((a, b) => a.proposed_at.localeCompare(b.proposed_at))
   const used = new Set<string>()
   const byMessage = new Map<string, Action>()
@@ -139,15 +139,17 @@ function matchSentActions(messages: Message[], actions: Action[]): Map<string, A
 // dispatcher escaped it). Both land in the `rejected` state on the wire and
 // are told apart by the decision kind. Failed sends and everything else stay
 // work-order tickets.
-function renderAction(action: Action) {
-  if (action.tool === 'send_message' && draftText(action) != null) {
+function renderAction(action: Action, contextRevision: number) {
+  if ((action.tool === 'send_message' || action.tool === 'propose_response') && draftText(action) != null) {
     switch (action.state) {
       case 'proposed':
       case 'pending_approval':
       case 'approved':
       case 'approved_with_edits':
       case 'executing':
-        return <AgentDraft action={action} />
+		return <AgentDraft action={action} contextRevision={contextRevision} />
+	  case 'superseded':
+		return <SupersededDraft action={action} />
       case 'rejected':
         switch (action.decision?.kind) {
           case 'dismiss':
@@ -161,7 +163,7 @@ function renderAction(action: Action) {
         return null
     }
   }
-  return <ActionTicket action={action} />
+  return <ActionTicket action={action} contextRevision={contextRevision} />
 }
 
 // Run/channel internals live behind this popover: useful when something
@@ -269,7 +271,7 @@ export function ConversationPage() {
                         </MessageScrollerItem>
                       )
                     }
-                    const rendered = renderAction(item.action)
+					const rendered = renderAction(item.action, data.conversation.context_revision)
                     if (!rendered) return null
                     return (
                       <MessageScrollerItem
@@ -285,7 +287,7 @@ export function ConversationPage() {
                     name={data.customer?.name}
                     closed={closed}
                   />
-                  <DispatcherComposer conversationId={data.conversation.id} closed={closed} />
+				  <DispatcherComposer conversationId={data.conversation.id} contextRevision={data.conversation.context_revision} closed={closed} />
                 </MessageScrollerContent>
               </MessageScrollerViewport>
               <MessageScrollerButton />
@@ -297,6 +299,9 @@ export function ConversationPage() {
       <aside className="w-80 shrink-0 overflow-y-auto border-l p-3">
         <JobPanel
           record={data.case}
+		  candidates={data.candidate_cases ?? []}
+		  conversationId={data.conversation.id}
+		  sourceMessageIds={(data.messages ?? []).filter(m=>m.direction==='inbound').slice(-5).map(m=>m.id)}
           customerName={data.customer?.name}
           contact={data.contact}
           run={data.run}
@@ -393,6 +398,7 @@ function MessageBubble({ message, sentBy }: { message: Message; sentBy?: Action 
           </Bubble>
           <MessageFooter>
             <TimeAgo at={message.created_at} />
+			<DeliveryLabel message={message} />
           </MessageFooter>
         </MessageContent>
       </MessageRow>
@@ -412,10 +418,17 @@ function MessageBubble({ message, sentBy }: { message: Message; sentBy?: Action 
         {original != null && original !== message.body && <OriginalDraft text={original} />}
         <MessageFooter>
           <TimeAgo at={message.created_at} />
+		  <DeliveryLabel message={message} />
         </MessageFooter>
       </MessageContent>
     </MessageRow>
   )
+}
+
+function DeliveryLabel({ message }: { message: Message }) {
+  if (message.direction === 'inbound' || message.delivery_state === 'sent') return null
+  const blocked = message.delivery_state === 'failed' || message.delivery_state === 'unknown'
+  return <Badge variant={blocked ? 'destructive' : 'outline'}>{message.delivery_state}</Badge>
 }
 
 // An edited reply keeps the agent's pre-edit text one click away — the
