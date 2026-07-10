@@ -24,6 +24,13 @@ const (
 	// budget and was stopped; the application reacts (e.g. summons a human)
 	// via the hook on temporalkit.Activities.
 	EventTurnBudgetExceeded EventType = "turn_budget_exceeded"
+	// EventDecisionDropped records a human decision that arrived for an
+	// action that was no longer (or never) pending — a supersede race, a
+	// second dispatcher's ruling after the first landed, a stale retry. The
+	// decision API acks before the workflow consumes the signal, so without
+	// this event the ruling would vanish from the audit trail (OVERVIEW
+	// §6.1 #4).
+	EventDecisionDropped EventType = "decision_dropped"
 )
 
 // Event is one entry in a run's append-only log — the audit trail, the

@@ -157,6 +157,32 @@ func (a *Activities) RecordTurnBudgetExceeded(ctx context.Context, in TurnBudget
 	return nil
 }
 
+// DroppedDecisionInput records a decision the workflow could not apply.
+type DroppedDecisionInput struct {
+	RunID      string         `json:"run_id"`
+	OrgID      string         `json:"org_id"`
+	Decision   DecisionSignal `json:"decision"`
+	DropReason string         `json:"drop_reason"`
+}
+
+// RecordDroppedDecision appends the decision_dropped event. The dedupe key is
+// the decision's content (action, kind, decider), so activity retries and a
+// client re-sending the identical ruling collapse to one event while distinct
+// rulings each get recorded.
+func (a *Activities) RecordDroppedDecision(ctx context.Context, in DroppedDecisionInput) error {
+	d := in.Decision
+	return a.Store.AppendEvent(ctx, event(in.OrgID, in.RunID,
+		agentkit.EventDecisionDropped,
+		fmt.Sprintf("decision_dropped:%s:%s:%s", d.ActionID, d.Kind, d.DecidedBy),
+		map[string]any{
+			"action_id":   d.ActionID,
+			"kind":        d.Kind,
+			"decided_by":  d.DecidedBy,
+			"reason":      d.Reason,
+			"drop_reason": in.DropReason,
+		}))
+}
+
 // ProposeActionInput records one proposed tool call and runs it through the
 // policy. Idempotent on (RunID, ToolCall.ID).
 type ProposeActionInput struct {

@@ -66,7 +66,11 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 		// the agent runs a turn only when the *customer* spoke — a dispatcher
 		// message informs the agent without provoking it to talk over a human
 		// who is handling the conversation (design/003-dispatcher-as-participant.md).
-		sawCustomer := awaitContext(ctx, inboundCh, dispatcherCh, log)
+		sawCustomer, dropped := awaitContext(ctx, inboundCh, dispatcherCh, decisionCh, log)
+		for _, d := range dropped {
+			recordDroppedDecision(actCtx, input, d,
+				"no action was awaiting a decision", logger)
+		}
 		if sawCustomer {
 			terminal, err := agentTurn(llmCtx, actCtx, decisionCh, dispatcherCh, input, log, &llmCalls)
 			if err != nil {
@@ -81,7 +85,8 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 		// Between turns is the safe point to roll over a long history. The
 		// transcript lives in Postgres; the new input carries only the
 		// counters and the unflushed delta.
-		if workflow.GetInfo(ctx).GetContinueAsNewSuggested() && inboundCh.Len() == 0 && dispatcherCh.Len() == 0 {
+		if workflow.GetInfo(ctx).GetContinueAsNewSuggested() &&
+			inboundCh.Len() == 0 && dispatcherCh.Len() == 0 && decisionCh.Len() == 0 {
 			next := input
 			next.TranscriptLen = log.transcriptLen
 			next.PendingMessages = log.pending
@@ -138,8 +143,13 @@ func (l *messageLog) mark(id string) bool {
 // context (skipping redelivered ones). It reports whether any *new* customer
 // (inbound) message arrived — the trigger for an agent turn. A dispatcher
 // message updates context without provoking a turn.
-func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh workflow.ReceiveChannel, log *messageLog) bool {
-	sawCustomer := false
+//
+// Decision signals are also received here: while the run is between turns no
+// action is awaiting a decision, so any ruling that arrives is inapplicable
+// by definition. They are returned to the caller to be recorded as
+// decision_dropped events (OVERVIEW §6.1 #4) rather than sitting in the
+// channel forever (which would also block ContinueAsNew).
+func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh, decisionCh workflow.ReceiveChannel, log *messageLog) (sawCustomer bool, dropped []DecisionSignal) {
 	absorbInbound := func(m InboundMessage) {
 		if log.mark(m.MessageID) {
 			log.pending = append(log.pending, llm.UserText(ExternalText(m.Text)))
@@ -162,8 +172,13 @@ func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh workflow.Receive
 		c.Receive(ctx, &m)
 		absorbDispatcher(m)
 	})
+	sel.AddReceive(decisionCh, func(c workflow.ReceiveChannel, _ bool) {
+		var d DecisionSignal
+		c.Receive(ctx, &d)
+		dropped = append(dropped, d)
+	})
 	sel.Select(ctx) // block for the first
-	// Drain the rest without blocking, checking both kinds each pass so a
+	// Drain the rest without blocking, checking all kinds each pass so a
 	// backlog stays roughly in arrival order.
 	for {
 		var in InboundMessage
@@ -176,9 +191,29 @@ func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh workflow.Receive
 			absorbDispatcher(dm)
 			continue
 		}
+		var d DecisionSignal
+		if decisionCh.ReceiveAsync(&d) {
+			dropped = append(dropped, d)
+			continue
+		}
 		break
 	}
-	return sawCustomer
+	return sawCustomer, dropped
+}
+
+// recordDroppedDecision appends the decision_dropped audit event. Best-effort:
+// a failure loses only the record of an already-inapplicable ruling, so it is
+// logged rather than failing the run.
+func recordDroppedDecision(actCtx workflow.Context, input AgentLoopInput, d DecisionSignal, dropReason string, logger log.Logger) {
+	err := workflow.ExecuteActivity(actCtx, "RecordDroppedDecision", DroppedDecisionInput{
+		RunID:      input.RunID,
+		OrgID:      input.OrgID,
+		Decision:   d,
+		DropReason: dropReason,
+	}).Get(actCtx, nil)
+	if err != nil {
+		logger.Error("record dropped decision failed", "action_id", d.ActionID, "error", err)
+	}
 }
 
 func finishRun(actCtx workflow.Context, input AgentLoopInput, status agentkit.RunStatus, logger log.Logger) error {
@@ -372,7 +407,12 @@ func decideAndExecute(actCtx workflow.Context, decisionCh, dispatcherCh workflow
 		}
 
 		if decision.ActionID != action.ID {
-			logger.Warn("decision for unexpected action ignored", "got", decision.ActionID, "want", action.ID)
+			// Not for the action on the table (stale retry, second dispatcher,
+			// supersede race). The API acked it already — record the ruling on
+			// the audit trail instead of vanishing it (OVERVIEW §6.1 #4).
+			logger.Warn("decision for unexpected action dropped", "got", decision.ActionID, "want", action.ID)
+			recordDroppedDecision(actCtx, input, *decision,
+				"a decision arrived while a different action was pending", logger)
 			continue
 		}
 		err := workflow.ExecuteActivity(actCtx, "RecordDecision", RecordDecisionInput{
