@@ -337,14 +337,28 @@ func (s *Store) LatestRunIDForConversation(ctx context.Context, conversationID s
 // the current-view projection the dispatcher UI reads (design/001-escalation.md).
 // Idempotent under the action pipeline's retries — the same escalation
 // re-applied is a no-op change.
-func (s *Store) RaiseEscalation(ctx context.Context, conversationID, reason string) error {
-	_, err := s.pool.Exec(ctx, `
-		UPDATE conversations
+//
+// The returned bool is true only when this call transitioned the conversation
+// *into* flagged. Notification (OVERVIEW §6.3 #13) keys on that transition:
+// activity retries and repeat escalates on an already-flagged thread update
+// the reason but never re-page the dispatcher.
+func (s *Store) RaiseEscalation(ctx context.Context, conversationID, reason string) (bool, error) {
+	var prev AttentionState
+	row := s.pool.QueryRow(ctx, `
+		UPDATE conversations c
 		SET attention_state = 'flagged', attention_reason = $2,
 		    escalated_at = now(), updated_at = now()
-		WHERE id = $1`,
+		FROM (SELECT id, attention_state FROM conversations WHERE id = $1 FOR UPDATE) prev
+		WHERE c.id = prev.id
+		RETURNING prev.attention_state`,
 		conversationID, reason)
-	return err
+	if err := row.Scan(&prev); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return false, ErrNotFound
+		}
+		return false, err
+	}
+	return prev != AttentionFlagged, nil
 }
 
 // AcknowledgeEscalation marks a flagged conversation as engaged by a

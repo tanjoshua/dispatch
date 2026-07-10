@@ -15,7 +15,7 @@ import (
 // record-keeping auto-approves; anything customer-facing or terminal needs a
 // human, and unknown tools fall back to the safe default.
 func TestIntakePolicyRouting(t *testing.T) {
-	policy := Definition("test-model", nil, nil).Policy
+	policy := Definition("test-model", nil, nil, nil).Policy
 	cases := map[string]agentkit.PolicyDecision{
 		"update_case":   agentkit.AutoApprove,
 		"continue_case": agentkit.AutoApprove, // record-keeping, same footing as update_case

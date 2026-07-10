@@ -4,11 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 
 	"dispatch/agentkit"
 	"dispatch/app/channel"
 	"dispatch/app/domain"
+	"dispatch/app/notify"
 )
 
 // conversationFor resolves the conversation a tool call belongs to via the
@@ -158,7 +160,8 @@ func (t *updateCaseTool) Execute(ctx context.Context, input json.RawMessage) (js
 // not decide whether an action executes (the policy still does), only how
 // urgently a dispatcher engages. See design/001-escalation.md.
 type escalateTool struct {
-	store *domain.Store
+	store    *domain.Store
+	notifier notify.Notifier // nil when no notification path is configured
 }
 
 type escalateInput struct {
@@ -168,8 +171,15 @@ type escalateInput struct {
 
 func (t *escalateTool) Name() string { return "escalate" }
 
+// Description must stay honest about what escalating actually does — the
+// model calibrates its safety behavior on this claim (OVERVIEW §6.3 #13).
+// Only say "pages the dispatcher" when a notifier is really wired.
 func (t *escalateTool) Description() string {
-	return "Flag this conversation for urgent human attention now — call it whenever you judge that a situation is unsafe or that a human dispatcher should step in. This pages the dispatcher and pulls the conversation to the top of their queue. It doesn't send the customer anything, so if there's a safety step they should take, send that too. Raising it needs no approval."
+	reach := "This flags the conversation for urgent attention at the top of the dispatcher's queue (no page is sent, so they see it when they next check)."
+	if t.notifier != nil {
+		reach = "This immediately notifies the dispatcher and pulls the conversation to the top of their queue."
+	}
+	return "Flag this conversation for urgent human attention now — call it whenever you judge that a situation is unsafe or that a human dispatcher should step in. " + reach + " It doesn't send the customer anything, so if there's a safety step they should take, send that too. Raising it needs no approval."
 }
 
 func (t *escalateTool) InputSchema() json.RawMessage {
@@ -196,8 +206,27 @@ func (t *escalateTool) Execute(ctx context.Context, input json.RawMessage) (json
 	if err != nil {
 		return nil, err
 	}
-	if err := t.store.RaiseEscalation(ctx, conv.ID, in.Reason); err != nil {
+	newlyFlagged, err := t.store.RaiseEscalation(ctx, conv.ID, in.Reason)
+	if err != nil {
 		return nil, fmt.Errorf("escalate: %w", err)
+	}
+	// Best-effort delivery on the not-flagged → flagged transition only: a
+	// failed page degrades to flagged-in-UI (the projection is already set),
+	// and failing the action would retry into newlyFlagged=false — no re-page
+	// anyway, just a spurious tool error in the agent's context.
+	if newlyFlagged && t.notifier != nil {
+		e := notify.Escalation{
+			OrgID:          conv.OrgID,
+			ConversationID: conv.ID,
+			Reason:         in.Reason,
+			Source:         "escalate_tool",
+		}
+		if cust, err := t.store.GetCustomer(ctx, conv.CustomerID); err == nil {
+			e.CustomerName = cust.Name
+		}
+		if err := t.notifier.Notify(ctx, e); err != nil {
+			log.Printf("escalate: notification failed for conversation %s: %v", conv.ID, err)
+		}
 	}
 	return json.RawMessage(`{"status":"escalated"}`), nil
 }

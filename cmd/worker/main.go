@@ -13,6 +13,7 @@ import (
 	"dispatch/agentkit/llm"
 	"dispatch/agentkit/llm/anthropic"
 	"dispatch/app/agents/intake"
+	"dispatch/app/notify"
 	appworker "dispatch/app/worker"
 )
 
@@ -48,7 +49,15 @@ func main() {
 	}
 	defer tc.Close()
 
-	w := appworker.New(tc, pool, model, llmClient)
+	var notifier notify.Notifier
+	if url := os.Getenv("DISPATCH_ESCALATION_WEBHOOK_URL"); url != "" {
+		notifier = notify.NewWebhook(url)
+		log.Println("escalation notifications: webhook configured")
+	} else {
+		log.Println("warning: DISPATCH_ESCALATION_WEBHOOK_URL is not set; escalations only flag the UI queue (the escalate tool description reflects this)")
+	}
+
+	w := appworker.New(tc, pool, model, llmClient, notifier)
 	log.Printf("worker starting (model=%s, temporal=%s)", model, temporalAddr)
 	if err := w.Run(worker.InterruptCh()); err != nil {
 		log.Fatalf("worker: %v", err)

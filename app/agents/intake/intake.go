@@ -8,6 +8,7 @@ import (
 	"dispatch/agentkit/temporalkit"
 	"dispatch/app/channel"
 	"dispatch/app/domain"
+	"dispatch/app/notify"
 )
 
 const AgentName = "intake"
@@ -41,8 +42,9 @@ Never invent details the customer didn't give you. Never promise arrival times o
 // Definition wires the intake agent: prompt, tools, and policy. update_case
 // (internal record-keeping) and escalate (raising an alarm) are auto-approved;
 // customer-facing send_message and the terminal close_case still require
-// approval.
-func Definition(model string, store *domain.Store, sender *channel.Sender) temporalkit.AgentDefinition {
+// approval. notifier may be nil — the escalate tool then only flags the UI
+// queue, and its description says so.
+func Definition(model string, store *domain.Store, sender *channel.Sender, notifier notify.Notifier) temporalkit.AgentDefinition {
 	return temporalkit.AgentDefinition{
 		Name:      AgentName,
 		Model:     model,
@@ -53,7 +55,7 @@ func Definition(model string, store *domain.Store, sender *channel.Sender) tempo
 			&updateCaseTool{store: store},
 			&continueCaseTool{store: store},
 			&closeCaseTool{store: store},
-			&escalateTool{store: store},
+			&escalateTool{store: store, notifier: notifier},
 		),
 		Policy: agentkit.StaticPolicy{ByTool: map[string]agentkit.PolicyDecision{
 			"send_message": agentkit.RequireApproval,

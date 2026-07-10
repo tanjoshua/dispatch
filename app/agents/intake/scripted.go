@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"strings"
 
 	"dispatch/agentkit/llm"
 	"dispatch/agentkit/temporalkit"
@@ -71,6 +72,17 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 	switch {
 	case rejected:
 		content = []llm.ContentBlock{reply("Sorry about that — let me rephrase. Could you tell me a bit more?")}
+	// "gas" in the latest customer message plays the emergency path: escalate
+	// (auto-approved, exercises the notification pipeline) plus a safety
+	// message, per the real prompt's instructions.
+	case strings.Contains(strings.ToLower(lastText), "gas"):
+		content = []llm.ContentBlock{
+			call(1, "escalate", map[string]string{
+				"reason":   "Possible gas emergency — customer says: " + lastText,
+				"category": "emergency",
+			}),
+			reply("That could be dangerous. Please leave the area, avoid flames or switches, and call your gas company's emergency line. I've alerted our dispatcher to contact you right away."),
+		}
 	case userTurns <= 1:
 		content = []llm.ContentBlock{
 			call(1, "update_case", map[string]string{"issue": lastText}),
