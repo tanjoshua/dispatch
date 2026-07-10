@@ -80,7 +80,7 @@ func (t *sendMessageTool) Execute(ctx context.Context, input json.RawMessage) (j
 	// The message ID is the action ID: a retried execution (crash between the
 	// send and FinishAction) re-delivers under the same ID, which persistence
 	// and real providers dedupe on — the customer never gets it twice.
-	if err := t.sender.Send(ctx, conv.ID, channel.OutboundMessage{
+	if err := t.sender.Send(ctx, conv.OrgID, conv.ID, channel.OutboundMessage{
 		Body:   in.Message,
 		Author: domain.AuthorAgent,
 		ID:     rc.ActionID,

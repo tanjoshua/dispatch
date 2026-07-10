@@ -263,6 +263,7 @@ func (a *Activities) recordDecision(ctx context.Context, actionID string, d agen
 // ExecuteActionInput executes an approved action's tool.
 type ExecuteActionInput struct {
 	ActionID string `json:"action_id"`
+	OrgID    string `json:"org_id"`
 	Agent    string `json:"agent"`
 }
 
@@ -283,7 +284,7 @@ func (a *Activities) ExecuteAction(ctx context.Context, in ExecuteActionInput) (
 	if err != nil {
 		return nil, err
 	}
-	action, err := a.Store.GetAction(ctx, in.ActionID)
+	action, err := a.Store.GetAction(ctx, in.OrgID, in.ActionID)
 	if err != nil {
 		return nil, err
 	}

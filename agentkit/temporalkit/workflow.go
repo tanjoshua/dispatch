@@ -429,6 +429,7 @@ func decideAndExecute(actCtx workflow.Context, decisionCh, dispatcherCh workflow
 		var result ExecuteActionResult
 		err := workflow.ExecuteActivity(actCtx, "ExecuteAction", ExecuteActionInput{
 			ActionID: action.ID,
+			OrgID:    input.OrgID,
 			Agent:    input.Agent,
 		}).Get(actCtx, &result)
 		if err != nil {

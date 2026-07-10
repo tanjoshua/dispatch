@@ -16,10 +16,14 @@ import (
 
 // Store is the persistence interface the agent loop's activities (and any
 // UI reading agentkit state) depend on.
+//
+// Reads that take an ID a client could supply also take the org ID and scope
+// the query to it (OVERVIEW §6.2 #10): tenant isolation is enforced at the
+// store signature, not left for each new endpoint to remember.
 type Store interface {
 	// CreateRun inserts the run; a run with the same ID is a no-op.
 	CreateRun(ctx context.Context, run agentkit.Run) error
-	GetRun(ctx context.Context, id string) (*agentkit.Run, error)
+	GetRun(ctx context.Context, orgID, id string) (*agentkit.Run, error)
 	// FinishRun sets a terminal status and appends the given event.
 	FinishRun(ctx context.Context, runID string, status agentkit.RunStatus, event agentkit.Event) error
 
@@ -35,8 +39,8 @@ type Store interface {
 	// corresponding event. Already-finished actions are returned unchanged.
 	FinishAction(ctx context.Context, actionID string, result json.RawMessage, execErr string, event agentkit.Event) (*agentkit.Action, error)
 
-	GetAction(ctx context.Context, id string) (*agentkit.Action, error)
-	ListActionsByRun(ctx context.Context, runID string) ([]agentkit.Action, error)
+	GetAction(ctx context.Context, orgID, id string) (*agentkit.Action, error)
+	ListActionsByRun(ctx context.Context, orgID, runID string) ([]agentkit.Action, error)
 	// DecisionStats aggregates decision outcomes and human-decision latency
 	// per tool for one org — the review-queue evidence (pending age,
 	// approval/edit/rejection rates) the autonomy policy is tuned on.
@@ -44,7 +48,7 @@ type Store interface {
 
 	// AppendEvent appends one event, ignoring duplicates by dedupe key.
 	AppendEvent(ctx context.Context, event agentkit.Event) error
-	ListEventsByRun(ctx context.Context, runID string) ([]agentkit.Event, error)
+	ListEventsByRun(ctx context.Context, orgID, runID string) ([]agentkit.Event, error)
 
 	// The run transcript: the agent's conversation context, one row per
 	// message, sequence numbers assigned by the workflow (deterministic under

@@ -31,7 +31,7 @@ func (s *Server) handleAcknowledge(w http.ResponseWriter, r *http.Request) {
 		req.AcknowledgedBy = "dispatcher"
 	}
 
-	conv, err := s.Domain.GetConversation(ctx, convID)
+	conv, err := s.Domain.GetConversation(ctx, s.DefaultOrgID, convID)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "conversation not found")

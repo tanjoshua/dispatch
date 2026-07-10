@@ -60,7 +60,7 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	action, err := s.Agentkit.GetAction(ctx, actionID)
+	action, err := s.Agentkit.GetAction(ctx, s.DefaultOrgID, actionID)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "action not found")

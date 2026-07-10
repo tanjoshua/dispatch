@@ -42,7 +42,7 @@ func (s *Server) handleDispatcherReply(w http.ResponseWriter, r *http.Request) {
 		req.SentBy = "dispatcher"
 	}
 
-	conv, err := s.Domain.GetConversation(ctx, convID)
+	conv, err := s.Domain.GetConversation(ctx, s.DefaultOrgID, convID)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "conversation not found")
@@ -55,7 +55,7 @@ func (s *Server) handleDispatcherReply(w http.ResponseWriter, r *http.Request) {
 	// dispatcher). The message ID is pinned so we can reference the persisted
 	// row in the event and the signal.
 	msgID := agentkit.NewID()
-	if err := s.Sender.Send(ctx, conv.ID, channel.OutboundMessage{
+	if err := s.Sender.Send(ctx, conv.OrgID, conv.ID, channel.OutboundMessage{
 		Body:   req.Text,
 		Author: domain.AuthorDispatcher,
 		ID:     msgID,
@@ -112,6 +112,6 @@ func (s *Server) handleDispatcherReply(w http.ResponseWriter, r *http.Request) {
 // runIsLive reports whether the run's workflow is still running, so a signal
 // won't error against a completed workflow.
 func (s *Server) runIsLive(ctx context.Context, runID string) bool {
-	run, err := s.Agentkit.GetRun(ctx, runID)
+	run, err := s.Agentkit.GetRun(ctx, s.DefaultOrgID, runID)
 	return err == nil && run.Status == agentkit.RunRunning
 }

@@ -108,8 +108,8 @@ func NewSender(store *domain.Store, reg Registry) *Sender {
 	return &Sender{store: store, reg: reg}
 }
 
-func (s *Sender) Send(ctx context.Context, conversationID string, msg OutboundMessage) error {
-	conv, err := s.store.GetConversation(ctx, conversationID)
+func (s *Sender) Send(ctx context.Context, orgID, conversationID string, msg OutboundMessage) error {
+	conv, err := s.store.GetConversation(ctx, orgID, conversationID)
 	if err != nil {
 		return err
 	}
@@ -258,7 +258,7 @@ func (r *Router) ensureRun(ctx context.Context, orgID string, conv *domain.Conve
 		return "", err
 	}
 	if latest != "" {
-		run, err := r.agentkit.GetRun(ctx, latest)
+		run, err := r.agentkit.GetRun(ctx, orgID, latest)
 		if err != nil && !errors.Is(err, akstore.ErrNotFound) {
 			return "", err
 		}

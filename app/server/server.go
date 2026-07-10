@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"os"
 	"time"
 
 	temporalclient "go.temporal.io/sdk/client"
@@ -62,8 +63,13 @@ func (s *Server) handleDecisionStats(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"tools": stats})
 }
 
-// cors allows the Vite dev server during development.
+// cors allows cross-origin browser access only when DISPATCH_DEV_CORS is set.
+// The normal dev path doesn't need it (Vite proxies /api same-origin), and a
+// wildcard must never ship (OVERVIEW §6.2 #10).
 func cors(next http.Handler) http.Handler {
+	if os.Getenv("DISPATCH_DEV_CORS") == "" {
+		return next
+	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
@@ -128,7 +134,7 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 			sum.LastMessage = &msgs[len(msgs)-1]
 		}
 		if runID, err := s.Domain.LatestRunIDForConversation(ctx, c.ID); err == nil && runID != "" {
-			actions, err := s.Agentkit.ListActionsByRun(ctx, runID)
+			actions, err := s.Agentkit.ListActionsByRun(ctx, s.DefaultOrgID, runID)
 			if err == nil {
 				for _, a := range actions {
 					if a.State == agentkit.ActionPendingApproval {
@@ -158,7 +164,7 @@ type conversationDetail struct {
 
 func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	conv, err := s.Domain.GetConversation(ctx, r.PathValue("id"))
+	conv, err := s.Domain.GetConversation(ctx, s.DefaultOrgID, r.PathValue("id"))
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "conversation not found")
@@ -181,10 +187,10 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 		detail.Case = c
 	}
 	if runID, err := s.Domain.LatestRunIDForConversation(ctx, conv.ID); err == nil && runID != "" {
-		if run, err := s.Agentkit.GetRun(ctx, runID); err == nil {
+		if run, err := s.Agentkit.GetRun(ctx, s.DefaultOrgID, runID); err == nil {
 			detail.Run = run
 		}
-		if actions, err := s.Agentkit.ListActionsByRun(ctx, runID); err == nil {
+		if actions, err := s.Agentkit.ListActionsByRun(ctx, s.DefaultOrgID, runID); err == nil {
 			detail.Actions = actions
 		}
 	}
@@ -192,7 +198,7 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
-	events, err := s.Agentkit.ListEventsByRun(r.Context(), r.PathValue("id"))
+	events, err := s.Agentkit.ListEventsByRun(r.Context(), s.DefaultOrgID, r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

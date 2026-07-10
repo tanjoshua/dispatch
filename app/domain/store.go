@@ -241,11 +241,15 @@ func (s *Store) CreateConversation(ctx context.Context, orgID, customerID, chann
 	if tag.RowsAffected() == 0 {
 		return s.ThreadForCustomerChannel(ctx, orgID, customerID, channelID)
 	}
-	return s.GetConversation(ctx, id)
+	return s.GetConversation(ctx, orgID, id)
 }
 
-func (s *Store) GetConversation(ctx context.Context, id string) (*Conversation, error) {
-	return s.scanConversation(s.pool.QueryRow(ctx, conversationSelect+` WHERE id = $1`, id))
+// GetConversation is org-scoped: the ID may come from a client, so tenant
+// isolation is enforced here rather than left to each caller (OVERVIEW §6.2
+// #10).
+func (s *Store) GetConversation(ctx context.Context, orgID, id string) (*Conversation, error) {
+	return s.scanConversation(s.pool.QueryRow(ctx,
+		conversationSelect+` WHERE id = $1 AND org_id = $2`, id, orgID))
 }
 
 // ThreadForCustomerChannel returns the customer's persistent thread on a

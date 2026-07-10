@@ -32,10 +32,10 @@ func (s *Postgres) CreateRun(ctx context.Context, run agentkit.Run) error {
 	return err
 }
 
-func (s *Postgres) GetRun(ctx context.Context, id string) (*agentkit.Run, error) {
+func (s *Postgres) GetRun(ctx context.Context, orgID, id string) (*agentkit.Run, error) {
 	row := s.pool.QueryRow(ctx, `
 		SELECT id, org_id, agent, status, created_at, updated_at
-		FROM runs WHERE id = $1`, id)
+		FROM runs WHERE id = $1 AND org_id = $2`, id, orgID)
 	var r agentkit.Run
 	if err := row.Scan(&r.ID, &r.OrgID, &r.Agent, &r.Status, &r.CreatedAt, &r.UpdatedAt); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -105,7 +105,7 @@ func (s *Postgres) RecordDecision(ctx context.Context, actionID string, decision
 	if err != nil {
 		return nil, err
 	}
-	return s.GetAction(ctx, actionID)
+	return s.GetAction(ctx, event.OrgID, actionID)
 }
 
 func (s *Postgres) FinishAction(ctx context.Context, actionID string, result json.RawMessage, execErr string, event agentkit.Event) (*agentkit.Action, error) {
@@ -130,11 +130,11 @@ func (s *Postgres) FinishAction(ctx context.Context, actionID string, result jso
 	if err != nil {
 		return nil, err
 	}
-	return s.GetAction(ctx, actionID)
+	return s.GetAction(ctx, event.OrgID, actionID)
 }
 
-func (s *Postgres) GetAction(ctx context.Context, id string) (*agentkit.Action, error) {
-	return s.scanAction(s.pool.QueryRow(ctx, actionSelect+` WHERE id = $1`, id))
+func (s *Postgres) GetAction(ctx context.Context, orgID, id string) (*agentkit.Action, error) {
+	return s.scanAction(s.pool.QueryRow(ctx, actionSelect+` WHERE id = $1 AND org_id = $2`, id, orgID))
 }
 
 func (s *Postgres) getActionByToolCall(ctx context.Context, runID, toolCallID string) (*agentkit.Action, error) {
@@ -142,8 +142,8 @@ func (s *Postgres) getActionByToolCall(ctx context.Context, runID, toolCallID st
 		actionSelect+` WHERE run_id = $1 AND tool_call_id = $2`, runID, toolCallID))
 }
 
-func (s *Postgres) ListActionsByRun(ctx context.Context, runID string) ([]agentkit.Action, error) {
-	rows, err := s.pool.Query(ctx, actionSelect+` WHERE run_id = $1 ORDER BY proposed_at`, runID)
+func (s *Postgres) ListActionsByRun(ctx context.Context, orgID, runID string) ([]agentkit.Action, error) {
+	rows, err := s.pool.Query(ctx, actionSelect+` WHERE run_id = $1 AND org_id = $2 ORDER BY proposed_at`, runID, orgID)
 	if err != nil {
 		return nil, err
 	}
@@ -163,10 +163,10 @@ func (s *Postgres) AppendEvent(ctx context.Context, event agentkit.Event) error 
 	return s.inTx(ctx, func(tx pgx.Tx) error { return appendEvent(ctx, tx, event) })
 }
 
-func (s *Postgres) ListEventsByRun(ctx context.Context, runID string) ([]agentkit.Event, error) {
+func (s *Postgres) ListEventsByRun(ctx context.Context, orgID, runID string) ([]agentkit.Event, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, org_id, run_id, type, payload, dedupe_key, created_at
-		FROM events WHERE run_id = $1 ORDER BY created_at, id`, runID)
+		FROM events WHERE run_id = $1 AND org_id = $2 ORDER BY created_at, id`, runID, orgID)
 	if err != nil {
 		return nil, err
 	}
