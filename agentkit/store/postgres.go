@@ -215,6 +215,46 @@ func (s *Postgres) scanAction(row pgx.Row) (*agentkit.Action, error) {
 	return &a, nil
 }
 
+func (s *Postgres) DecisionStats(ctx context.Context, orgID string) ([]agentkit.ToolDecisionStats, error) {
+	// Human-latency figures exclude policy auto-decisions (instant by
+	// construction) and count only decided actions.
+	rows, err := s.pool.Query(ctx, `
+		SELECT tool,
+		       count(*) AS proposed,
+		       count(*) FILTER (WHERE decision_kind = 'approve' AND decided_by = 'policy:auto') AS auto_approved,
+		       count(*) FILTER (WHERE decision_kind = 'approve' AND decided_by <> 'policy:auto') AS approved,
+		       count(*) FILTER (WHERE decision_kind = 'approve_with_edits') AS approved_with_edits,
+		       count(*) FILTER (WHERE decision_kind = 'reject' AND decided_by <> 'policy:auto') AS rejected,
+		       count(*) FILTER (WHERE decision_kind = 'dismiss') AS dismissed,
+		       count(*) FILTER (WHERE decision_kind = 'supersede') AS superseded,
+		       count(*) FILTER (WHERE state = 'pending_approval') AS pending,
+		       min(proposed_at) FILTER (WHERE state = 'pending_approval') AS oldest_pending_at,
+		       avg(EXTRACT(EPOCH FROM decided_at - proposed_at))
+		           FILTER (WHERE decided_at IS NOT NULL AND decided_by <> 'policy:auto') AS avg_decision_seconds,
+		       percentile_cont(0.5) WITHIN GROUP (ORDER BY EXTRACT(EPOCH FROM decided_at - proposed_at))
+		           FILTER (WHERE decided_at IS NOT NULL AND decided_by <> 'policy:auto') AS median_decision_seconds
+		FROM actions
+		WHERE org_id = $1
+		GROUP BY tool
+		ORDER BY tool`, orgID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []agentkit.ToolDecisionStats
+	for rows.Next() {
+		var st agentkit.ToolDecisionStats
+		if err := rows.Scan(&st.Tool, &st.Proposed, &st.AutoApproved, &st.Approved,
+			&st.ApprovedWithEdits, &st.Rejected, &st.Dismissed, &st.Superseded,
+			&st.Pending, &st.OldestPendingAt,
+			&st.AvgDecisionSeconds, &st.MedianDecisionSeconds); err != nil {
+			return nil, err
+		}
+		out = append(out, st)
+	}
+	return out, rows.Err()
+}
+
 // appendEvent inserts one event, ignoring (run_id, dedupe_key) duplicates.
 // The events table is append-only; this is the only writer.
 func appendEvent(ctx context.Context, tx pgx.Tx, e agentkit.Event) error {

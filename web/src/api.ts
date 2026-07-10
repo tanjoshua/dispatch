@@ -110,6 +110,9 @@ export interface ConversationSummary {
   contact: string // customer's address on this thread's channel (design/004 §3)
   last_message?: Message
   pending_count: number
+  // When the longest-waiting pending action was proposed. Decision latency is
+  // the existential product risk — the age is worn on the row.
+  oldest_pending_at?: string
 }
 
 export interface ConversationDetail {
@@ -120,6 +123,24 @@ export interface ConversationDetail {
   case?: Case
   run?: Run
   actions: Action[] | null
+}
+
+// ToolDecisionStats mirrors agentkit.ToolDecisionStats: per-tool decision
+// outcomes and human-decision latency — the evidence the autonomy slider
+// (RequireApproval → AutoApprove) moves on.
+export interface ToolDecisionStats {
+  tool: string
+  proposed: number
+  auto_approved: number
+  approved: number // human, without edits
+  approved_with_edits: number
+  rejected: number
+  dismissed: number
+  superseded: number
+  pending: number
+  oldest_pending_at?: string
+  avg_decision_seconds?: number
+  median_decision_seconds?: number
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
@@ -140,6 +161,10 @@ export function listConversations() {
 
 export function getConversation(id: string) {
   return request<ConversationDetail>(`/api/conversations/${id}`)
+}
+
+export function getDecisionStats() {
+  return request<{ tools: ToolDecisionStats[] }>('/api/stats/decisions')
 }
 
 export function sendInbound(input: { phone: string; name: string; text: string }) {

@@ -101,3 +101,24 @@ func (a *Action) EffectiveInput() json.RawMessage {
 	}
 	return a.Input
 }
+
+// ToolDecisionStats aggregates one tool's decision outcomes and latency — the
+// evidence the autonomy slider moves on. A tool that humans approve unedited
+// 98% of the time at painful latency is a candidate for auto-approval; one
+// that keeps getting edited is not. Latency figures cover human decisions
+// only (policy auto-decisions are instant and would flatter the numbers).
+type ToolDecisionStats struct {
+	Tool              string     `json:"tool"`
+	Proposed          int        `json:"proposed"`
+	AutoApproved      int        `json:"auto_approved"`
+	Approved          int        `json:"approved"` // human, without edits
+	ApprovedWithEdits int        `json:"approved_with_edits"`
+	Rejected          int        `json:"rejected"` // human rejections (excludes policy forbids)
+	Dismissed         int        `json:"dismissed"`
+	Superseded        int        `json:"superseded"`
+	Pending           int        `json:"pending"`
+	OldestPendingAt   *time.Time `json:"oldest_pending_at,omitempty"`
+	// Seconds from proposal to human decision.
+	AvgDecisionSeconds    *float64 `json:"avg_decision_seconds,omitempty"`
+	MedianDecisionSeconds *float64 `json:"median_decision_seconds,omitempty"`
+}

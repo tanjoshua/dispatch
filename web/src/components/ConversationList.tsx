@@ -4,6 +4,7 @@ import { PlusIcon, TriangleAlertIcon } from 'lucide-react'
 import { listConversations } from '../api'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { waitingFor } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
 export function ConversationList() {
@@ -61,6 +62,7 @@ export function ConversationList() {
                   {!flagged && c.pending_count > 0 && (
                     <Badge variant="signal" className="pulse-soft shrink-0 font-mono">
                       {c.pending_count} to review
+                      {c.oldest_pending_at ? ` · ${waitingFor(c.oldest_pending_at)}` : ''}
                     </Badge>
                   )}
                   {!flagged && c.conversation.status === 'closed' && c.pending_count === 0 && (

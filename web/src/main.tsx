@@ -11,6 +11,7 @@ import './index.css'
 import { Layout } from './components/Layout'
 import { Home } from './pages/Home'
 import { ConversationPage } from './pages/ConversationPage'
+import { StatsPage } from './pages/StatsPage'
 import { TooltipProvider } from '@/components/ui/tooltip'
 
 const queryClient = new QueryClient()
@@ -29,8 +30,14 @@ export const conversationRoute = createRoute({
   component: ConversationPage,
 })
 
+const statsRoute = createRoute({
+  getParentRoute: () => rootRoute,
+  path: '/stats',
+  component: StatsPage,
+})
+
 const router = createRouter({
-  routeTree: rootRoute.addChildren([indexRoute, conversationRoute]),
+  routeTree: rootRoute.addChildren([indexRoute, conversationRoute, statsRoute]),
 })
 
 declare module '@tanstack/react-router' {

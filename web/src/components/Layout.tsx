@@ -1,8 +1,11 @@
-import { Outlet } from '@tanstack/react-router'
+import { Link, Outlet } from '@tanstack/react-router'
 import { useQuery } from '@tanstack/react-query'
+import { ChartColumnIcon } from 'lucide-react'
 import { listConversations } from '../api'
 import { ConversationList } from './ConversationList'
 import { Badge } from '@/components/ui/badge'
+import { Button } from '@/components/ui/button'
+import { waitingFor } from '@/lib/format'
 
 export function Layout() {
   const { data } = useQuery({
@@ -10,10 +13,14 @@ export function Layout() {
     queryFn: listConversations,
     refetchInterval: 3000,
   })
-  const pendingTotal = (data?.conversations ?? []).reduce(
-    (sum, c) => sum + c.pending_count,
-    0,
-  )
+  const conversations = data?.conversations ?? []
+  const pendingTotal = conversations.reduce((sum, c) => sum + c.pending_count, 0)
+  // The queue's worst wait, worn in the header: decision latency is the
+  // number this product lives or dies on.
+  const oldestPending = conversations
+    .map((c) => c.oldest_pending_at)
+    .filter((at): at is string => !!at)
+    .sort()[0]
 
   return (
     <div className="flex h-full flex-col">
@@ -25,11 +32,20 @@ export function Layout() {
         <span className="hidden text-sm text-muted-foreground sm:block">
           The intake agent proposes, you decide.
         </span>
-        {pendingTotal > 0 && (
-          <Badge variant="signal" className="pulse-soft ml-auto font-mono">
-            {pendingTotal} awaiting decision
-          </Badge>
-        )}
+        <span className="ml-auto flex items-center gap-2">
+          {pendingTotal > 0 && (
+            <Badge variant="signal" className="pulse-soft font-mono">
+              {pendingTotal} awaiting decision
+              {oldestPending ? ` · ${waitingFor(oldestPending)}` : ''}
+            </Badge>
+          )}
+          <Link to="/stats">
+            <Button variant="ghost" size="xs" aria-label="Decision stats">
+              <ChartColumnIcon data-icon="inline-start" />
+              Stats
+            </Button>
+          </Link>
+        </span>
       </header>
       <div className="flex min-h-0 flex-1">
         <aside className="w-72 shrink-0 overflow-y-auto border-r bg-card">

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"time"
 
 	temporalclient "go.temporal.io/sdk/client"
 
@@ -42,7 +43,23 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/conversations/{id}/reply", s.handleDispatcherReply)
 	mux.HandleFunc("POST /api/conversations/{id}/acknowledge", s.handleAcknowledge)
 	mux.HandleFunc("GET /api/runs/{id}/events", s.handleRunEvents)
+	mux.HandleFunc("GET /api/stats/decisions", s.handleDecisionStats)
 	return cors(mux)
+}
+
+// handleDecisionStats serves per-tool decision outcomes and human-decision
+// latency — the evidence for moving tools between RequireApproval and
+// AutoApprove (OVERVIEW §6.3 #14).
+func (s *Server) handleDecisionStats(w http.ResponseWriter, r *http.Request) {
+	stats, err := s.Agentkit.DecisionStats(r.Context(), s.DefaultOrgID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if stats == nil {
+		stats = []agentkit.ToolDecisionStats{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"tools": stats})
 }
 
 // cors allows the Vite dev server during development.
@@ -85,6 +102,11 @@ type conversationSummary struct {
 	Contact      string          `json:"contact"`
 	LastMessage  *domain.Message `json:"last_message,omitempty"`
 	PendingCount int             `json:"pending_count"`
+	// OldestPendingAt is when the longest-waiting pending action was proposed.
+	// Decision latency is the existential product risk (WhatsApp expectations
+	// vs. review queues) — the age is worn on the row, not buried in a detail
+	// view (OVERVIEW §6.3 #14).
+	OldestPendingAt *time.Time `json:"oldest_pending_at,omitempty"`
 }
 
 func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request) {
@@ -111,6 +133,10 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 				for _, a := range actions {
 					if a.State == agentkit.ActionPendingApproval {
 						sum.PendingCount++
+						at := a.ProposedAt
+						if sum.OldestPendingAt == nil || at.Before(*sum.OldestPendingAt) {
+							sum.OldestPendingAt = &at
+						}
 					}
 				}
 			}

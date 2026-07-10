@@ -36,6 +36,10 @@ type Store interface {
 
 	GetAction(ctx context.Context, id string) (*agentkit.Action, error)
 	ListActionsByRun(ctx context.Context, runID string) ([]agentkit.Action, error)
+	// DecisionStats aggregates decision outcomes and human-decision latency
+	// per tool for one org — the review-queue evidence (pending age,
+	// approval/edit/rejection rates) the autonomy policy is tuned on.
+	DecisionStats(ctx context.Context, orgID string) ([]agentkit.ToolDecisionStats, error)
 
 	// AppendEvent appends one event, ignoring duplicates by dedupe key.
 	AppendEvent(ctx context.Context, event agentkit.Event) error

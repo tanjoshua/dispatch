@@ -16,6 +16,29 @@ export function exactTime(iso: string): string {
   return new Date(iso).toLocaleString()
 }
 
+/**
+ * Compact elapsed duration since `iso` ("42s", "3m", "2h", "1d") — how long a
+ * pending action has been waiting. Distinct from timeAgo: a wait is a number
+ * the dispatcher should feel, not a soft "just now".
+ */
+export function waitingFor(iso: string): string {
+  const seconds = Math.max(0, Math.round((Date.now() - new Date(iso).getTime()) / 1000))
+  if (seconds < 60) return `${seconds}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h`
+  return `${Math.floor(hours / 24)}d`
+}
+
+/** Seconds → compact duration ("42s", "3m", "2h") for latency stats. */
+export function duration(seconds: number): string {
+  if (seconds < 60) return `${Math.round(seconds)}s`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ${Math.round(seconds % 60)}s`
+  return `${Math.floor(minutes / 60)}h ${minutes % 60}m`
+}
+
 export function prettyJson(v: unknown): string {
   if (v == null) return ''
   return typeof v === 'string' ? v : JSON.stringify(v, null, 2)
@@ -25,8 +48,10 @@ export function prettyJson(v: unknown): string {
 // prettified form for tools this map doesn't know yet.
 const toolLabels: Record<string, string> = {
   send_message: 'Reply to customer',
-  update_job: 'Update job record',
-  close_job: 'Complete intake',
+  update_case: 'Update job record',
+  continue_case: 'Continue previous job',
+  close_case: 'Complete task',
+  escalate: 'Escalate to dispatcher',
 }
 
 export function toolLabel(tool: string): string {
