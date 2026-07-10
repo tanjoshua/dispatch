@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 	"time"
 
 	"dispatch/agentkit"
@@ -130,17 +131,34 @@ func (t *updateCaseTool) Execute(ctx context.Context, input json.RawMessage) (js
 	if err != nil {
 		return nil, err
 	}
-	// customer_name belongs on the customer, not the case — pull it out and
-	// route it there; the rest is the case's per-vertical data.
+	// customer_name belongs on the customer, not the case — but this tool is
+	// auto-approved, so it may only *fill in* a missing CRM name, never
+	// overwrite one (OVERVIEW §6.2 #8). A proposed change to an existing name
+	// stays in the case data bag, where the dispatcher sees the discrepancy
+	// and owns applying it.
 	if raw, ok := fields["customer_name"]; ok {
 		var name string
 		if err := json.Unmarshal(raw, &name); err != nil {
 			return nil, fmt.Errorf("update_case: invalid customer_name: %w", err)
 		}
-		if err := t.store.SetCustomerName(ctx, conv.CustomerID, name); err != nil {
+		name = strings.TrimSpace(name)
+		if strings.ContainsAny(name, "\n\r") || len(name) > 120 {
+			return nil, fmt.Errorf("update_case: customer_name must be a single line of at most 120 characters")
+		}
+		applied, err := t.store.SetCustomerNameIfBlank(ctx, conv.CustomerID, name)
+		if err != nil {
 			return nil, fmt.Errorf("update_case: %w", err)
 		}
-		delete(fields, "customer_name")
+		if !applied {
+			// Occupied. Same name → nothing to record; different → leave the
+			// proposal on the case rather than silently rewriting the CRM.
+			if cust, err := t.store.GetCustomer(ctx, conv.CustomerID); err == nil && strings.EqualFold(cust.Name, name) {
+				applied = true
+			}
+		}
+		if applied {
+			delete(fields, "customer_name")
+		}
 	}
 	patch, err := json.Marshal(fields)
 	if err != nil {

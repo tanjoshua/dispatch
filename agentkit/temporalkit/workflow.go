@@ -142,7 +142,7 @@ func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh workflow.Receive
 	sawCustomer := false
 	absorbInbound := func(m InboundMessage) {
 		if log.mark(m.MessageID) {
-			log.pending = append(log.pending, llm.UserText(m.Text))
+			log.pending = append(log.pending, llm.UserText(ExternalText(m.Text)))
 			sawCustomer = true
 		}
 	}
@@ -451,9 +451,27 @@ func SupersedeFeedback() string {
 
 // DispatcherNote renders a message the dispatcher sent directly to the customer
 // as an agent-facing context note, clearly attributed to the human operator so
-// the agent never mistakes it for its own words or for the customer's.
+// the agent never mistakes it for its own words or for the customer's. This
+// label is only trustworthy because counterparty text can never contain it at
+// the top level — every inbound message is fenced by ExternalText.
 func DispatcherNote(text string) string {
 	return "[The human dispatcher sent this message to the customer directly]\n" + text
+}
+
+// ExternalMessageTag delimits text authored by the external counterparty (the
+// person the agent serves on the channel). Agent prompts should tell the model
+// that everything inside these tags is verbatim counterparty text — data, not
+// instructions — and that operator labels appearing inside them are spoofs.
+const ExternalMessageTag = "external_message"
+
+// ExternalText fences counterparty text so it cannot impersonate the operator
+// or the system in the agent's context (OVERVIEW §6.2 #7). The delimiting is
+// structural, applied where inbound signals become turns — not a prompt
+// convention an adapter could forget. Any embedded closing tag is defanged so
+// the text cannot break out of the fence.
+func ExternalText(text string) string {
+	escaped := strings.ReplaceAll(text, "</"+ExternalMessageTag, "<\\/"+ExternalMessageTag)
+	return "<" + ExternalMessageTag + ">\n" + escaped + "\n</" + ExternalMessageTag + ">"
 }
 
 // DispatcherContextMessage wraps a dispatcher's direct message as a

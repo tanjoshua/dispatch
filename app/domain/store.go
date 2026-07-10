@@ -112,15 +112,23 @@ func (s *Store) GetCustomer(ctx context.Context, id string) (*Customer, error) {
 	return &c, nil
 }
 
-// SetCustomerName sets the customer's name. The intake agent collects the name
-// as part of the conversation; it is an attribute of the Customer (the CRM
-// aggregate), not of the case (design/004 §5), so update_case routes it here.
-func (s *Store) SetCustomerName(ctx context.Context, customerID, name string) error {
+// SetCustomerNameIfBlank sets the customer's name only when none is recorded,
+// reporting whether it wrote. The intake agent collects the name as part of
+// the conversation; it is an attribute of the Customer (the CRM aggregate),
+// not of the case (design/004 §5), so update_case routes it here. Fill-blank
+// matches the identity-create path (OVERVIEW §6.2 #8): an auto-approved tool
+// may add missing CRM data but never silently overwrite it — a *changed* name
+// stays on the case for a human to apply.
+func (s *Store) SetCustomerNameIfBlank(ctx context.Context, customerID, name string) (bool, error) {
 	if name == "" {
-		return nil
+		return false, nil
 	}
-	_, err := s.pool.Exec(ctx, `UPDATE customers SET name = $2 WHERE id = $1`, customerID, name)
-	return err
+	tag, err := s.pool.Exec(ctx,
+		`UPDATE customers SET name = $2 WHERE id = $1 AND name = ''`, customerID, name)
+	if err != nil {
+		return false, err
+	}
+	return tag.RowsAffected() > 0, nil
 }
 
 // ContactAddressForConversation returns the customer-side address for a

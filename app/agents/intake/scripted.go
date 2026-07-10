@@ -10,6 +10,16 @@ import (
 	"dispatch/agentkit/temporalkit"
 )
 
+// unfence strips the ExternalText delimiters a real model is told to treat as
+// data boundaries, so the script keys on the customer's actual words.
+func unfence(text string) string {
+	open, close := "<"+temporalkit.ExternalMessageTag+">", "</"+temporalkit.ExternalMessageTag+">"
+	text = strings.TrimSpace(text)
+	text = strings.TrimPrefix(text, open)
+	text = strings.TrimSuffix(text, close)
+	return strings.TrimSpace(text)
+}
+
 // ScriptedLLM is a deterministic stand-in for a real model, used for demos
 // and end-to-end tests without an API key (DISPATCH_FAKE_LLM=1). It walks a
 // fixed intake script keyed on how many customer messages it has seen, and
@@ -25,7 +35,7 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 			switch {
 			case m.Role == llm.RoleUser && b.Type == "text":
 				userTurns++
-				lastText = b.Text
+				lastText = unfence(b.Text)
 			case m.Role == llm.RoleAssistant && b.Type == "tool_use":
 				toolCalls++
 			}
