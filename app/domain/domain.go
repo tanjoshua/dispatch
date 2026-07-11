@@ -45,11 +45,34 @@ type Playbook struct {
 	ID        string          `json:"id"`
 	OrgID     string          `json:"org_id"`
 	Name      string          `json:"name"`
+	PackID    string          `json:"pack_id"`   // immutable code-owned capability pack
 	Agent     string          `json:"agent"`     // names a code-registered agent definition
 	CaseType  string          `json:"case_type"` // the case type this playbook produces
 	Config    json.RawMessage `json:"config,omitempty"`
 	Version   int64           `json:"version"`
 	CreatedAt time.Time       `json:"created_at"`
+}
+
+// AgentBehavior is the complete organization-editable portion of a playbook.
+// Pack, policy, tools, and model selection are deliberately not configurable
+// through this type.
+type AgentBehavior struct {
+	AgentName          string `json:"agent_name"`
+	Tone               string `json:"tone"`
+	CustomInstructions string `json:"custom_instructions"`
+}
+
+// AgentRuntimeSnapshot is the application state that determines one model
+// request. Store reads populate it with one SQL statement so the rendered
+// prompt and the action freshness basis cannot come from different versions.
+type AgentRuntimeSnapshot struct {
+	Playbook           Playbook
+	Organization       Organization
+	Stage              string
+	ConversationID     string
+	ContextRevision    int64
+	EventToSeq         int64
+	DependencyVersions json.RawMessage
 }
 
 // Customer is the CRM aggregate: a person or business the org serves. Contact

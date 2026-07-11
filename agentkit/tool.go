@@ -46,9 +46,12 @@ type runContextKey struct{}
 // its external effect's ID from ActionID (e.g. an outbound message ID, passed
 // to the provider as an idempotency key) delivers at most once.
 type RunContext struct {
-	RunID    string
-	OrgID    string
-	ActionID string
+	RunID           string
+	OrgID           string
+	ActionID        string
+	ModelTurnID     string
+	ContextRevision int64
+	EventToSeq      int64
 }
 
 // WithRunContext returns ctx carrying rc.

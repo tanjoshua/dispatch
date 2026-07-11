@@ -1,6 +1,6 @@
 # Dispatch — Implementation Overview & Roadmap
 
-**Last updated:** 2026-07-10
+**Last updated:** 2026-07-11
 **This is the single living doc:** what the product is, how it is built today,
 and the gaps to tackle next. It consolidates and supersedes the numbered design
 docs 000–005 and STATUS.md (all recoverable from git history; code comments
@@ -21,16 +21,18 @@ Three principles drive the architecture:
 
 1. **Every externally visible agent act is a typed Action** a human can
    approve, edit, or reject before it executes.
-2. **Human-in-the-loop is policy, not architecture.** v1: everything reviewed.
-   v2: auto-approve low-risk tools. v3: exceptions only. Nothing structural
-   changes between phases — only `Policy` does.
+2. **Human-in-the-loop is policy, not architecture.** v1 requires review for
+   customer communication and business mutations; read-only and narrow
+   safety/control actions are automatic. Future autonomy changes `Policy`, not
+   the loop or tool execution path.
 3. **The agent machinery (`agentkit`) is business-agnostic and reusable.**
    Dispatch is the first app built on it, not the only one.
 
-**Verticals rule:** verticals are **code packs selected and parameterized by
-config (playbooks)** — never a no-code workflow engine. Code owns the verbs
-(tools, lifecycles, the loop); config owns which pack is active, with which
-fields, under what policy, in whose voice.
+**Verticals rule:** verticals are **code packs** — never a no-code workflow
+engine. Code owns the pack, tools, case schema, models, safety policy,
+lifecycles, and loop. Each organization currently has one internal playbook
+binding exposed to administrators as **Agent Behavior**; organization config
+owns only the agent's name, tone, and custom instructions.
 
 ## 2. Architecture
 
@@ -68,9 +70,10 @@ import rule; a `go.work` in-repo module split is the reversible halfway step.
 
 ```
 Organization
- ├─ Playbook            selects the code agent (pack) + names the case type
+ ├─ Agent Behavior      one editable voice/instructions record, backed by an
+ │                      internal Playbook that pins a code-owned pack
  ├─ ChannelConnection   org's configured use of a channel kind; carries
- │                      default_playbook_id — where inbound routing binds
+ │                      default_playbook_id — server-owned singleton binding
  ├─ Customer            CRM aggregate (person/business)
  │   └─ ContactIdentity (channel_kind, address) — one customer, many
  ├─ Conversation        ONE persistent thread per (contact identity × connection);
@@ -96,21 +99,23 @@ Key cardinality decisions (these replaced the v1 1:1 chain):
 - **Run ≠ conversation.** Runs come and go per task; a thread has many, at
   most one awaiting customer input. `run_bindings` keeps agentkit's `runs`
   table business-agnostic. Its forward-only `stage` projection starts at
-  triage, advances to inquiry after a case-less response, and advances to
-  service job when a case is selected. The activity resolver reads it on each
-  turn, so pack-owned stage models apply without workflow state or imports.
-- **Playbook is the horizontal seam.** Connection → playbook → pack + case
-  type. The field-service pack owns fixed lanes, tools, policy floors,
-  per-stage models, and its prompt template. `playbooks.config` is a
-  schema-versioned envelope (`pack`, voice, per-lane policy); models are
-  vendor-owned, with a hidden per-stage override reserved for operations. It
-  parameterizes those capabilities but cannot reorder them into a workflow.
+  triage and advances only through the automatic `route_intent` Action (or an
+  explicit case selection/creation) to inquiry or service job. The activity
+  resolver reads it on each turn, so pack-owned stage models apply without
+  workflow state or imports.
+- **The internal playbook remains the horizontal seam.** Connection →
+  playbook → code-owned pack + case type. There is exactly one playbook per
+  organization today; channel routing assigns it server-side. Its schema-2
+  config contains voice only. The field-service pack owns fixed lanes, tools,
+  effect classifications, review policy, per-stage models, and prompt.
 - **Knowledge is organization-level.** `organizations.settings.profile`
   carries business name, hours, service area, and labeled facts. The pack
   prompt renders these as the only operational facts the agent may state.
   Organization, playbook, and channel-connection settings use versioned CAS
   writes. Every accepted command is snapshotted in append-only
-  `config_revisions` with command ID and actor attribution.
+  `config_revisions` with command ID and actor attribution. Agent Behavior also
+  reserves a request hash and exact result in `settings_commands`, so retries
+  replay success or conflict and reject key reuse with different input.
 
 ## 4. The agent loop
 
@@ -128,11 +133,13 @@ for run is open:
     if a customer spoke:                 # dispatcher msgs inform, never trigger
         loop (≤ MaxLLMCallsPerTurn, exceed → record + app hook → human):
             LLM turn (Complete flushes the delta to the Postgres transcript,
-                      assembles context there, records usage) →
+                      atomically resolves prompt + version basis, persists the
+                      exact request/context snapshot, canonical response, and
+                      usage) →
             enforce one effectful tool call per completion
             for each permitted tool call:
-              ProposeAction (with context + dependency versions) → Policy.Evaluate
-                → auto-approve | Forbid | durable wait for decision signal
+              ProposeAction (with model-turn + dependency snapshot) → Policy.Evaluate
+                → reads/controls auto | communication/mutations wait for review
               approved → validate input vs schema → ExecuteAction
                          (the ONLY place a tool runs)
               feedback (result / rejection reason / edit note) → agent context
@@ -161,10 +168,20 @@ for run is open:
   action execute" (per action — that stays with Policy). It projects
   `attention_state: flagged → acknowledged` on the conversation; flagged sorts
   to the top of the dispatcher's list.
+- **Model turns are immutable audit roots:** each completion is keyed by
+  `(run_id, seq)`, stores the exact request/response and context cursor, and
+  links every resulting Action by `model_turn_id`. Activity retries reuse the
+  persisted response; overlapping attempts converge on the first response.
+  Source message IDs are trusted metadata in model context and are validated
+  against that snapshot before a case or routing mutation executes. A Temporal
+  version marker keeps pre-cutover workflow histories replay-compatible. Reply
+  freshness cursors are stamped from the same snapshot rather than supplied by
+  the model. Conversation mutations record `action_id`; retries detect the
+  recorded domain event instead of applying the mutation twice.
 
 ## 5. What is implemented (verified end-to-end)
 
-### Residential-first correctness cutover (2026-07-10)
+### Residential-first correctness and Agent Behavior cutover (2026-07-11)
 
 - Conversations bind to an exact `contact_identity_id` and are unique by
   `(org_id, channel_id, contact_identity_id)`. Outbound routing uses that exact
@@ -182,8 +199,8 @@ for run is open:
   draft, supersedes that draft, and replans. The loop rejects mixed or multiple
   effectful calls without executing any of them and uses an eight-completion
   turn budget.
-- Dispatcher decisions are synchronous, actor-attributed by an
-  `ActorProvider`, command-idempotent, and compare action/context versions
+- Dispatcher decisions are synchronous, actor-attributed by the authenticated
+  request `Principal`, command-idempotent, and compare action/context versions
   under the conversation lock. Dispatcher replies use the same revision
   contract, persist queued delivery intent first, and expose delivery state.
 - The detail API exposes exact identity, selected case, customer-wide candidate
@@ -191,15 +208,14 @@ for run is open:
   UI renders one current response draft, case candidates, case corrections,
   conflict-safe decisions/replies, and blocked delivery states.
 
-Migration 0011 also creates the durable seams for the remaining coordinator
-cutover: `outbox`, `context_snapshots`, and `model_turns`. The active Temporal
-workflow is still the legacy run-scoped loop; replacing it with
-`ConversationCoordinatorV2`, processing outbox rows independently of the HTTP
-process, persisting per-turn snapshots/model requests, and performing
-delivery-dependent run completion remain the next implementation slice.
+Migration 0011 created the durable seams for the coordinator cutover. The
+run-scoped loop now actively writes `context_snapshots` and `model_turns`; the
+remaining slice is replacing it with `ConversationCoordinatorV2`, draining
+`outbox` independently of the HTTP process, and finishing the delivery-owned
+completion cutover.
 
 - **Infra:** docker-compose (Postgres 16 + Temporal dev server), `cmd/migrate`
-  (12 migrations), `cmd/server` (JSON API :8080), `cmd/worker`. ULIDs
+  (15 migrations), `cmd/server` (JSON API :8080), `cmd/worker`. ULIDs
   everywhere; `org_id` on every table (seeded `org_dev`, `chan_dev`,
   `pb_field_service`).
 - **agentkit:** full Action state machine with idempotent Postgres store;
@@ -213,13 +229,14 @@ delivery-dependent run completion remain the next implementation slice.
   `claude-opus-4-8`; unmodeled schema keywords pass through); temporalkit
   agent loop as above.
 - **Field-service pack:** a code-owned registry describes inquiry,
-  service-job, and locked quote lanes; live/coming-soon blocks; curated model
-  tiers; tool risk text, defaults, settings, and floors. Pure pack functions
-  validate writes and compute the same effective configuration used at
-  runtime and in the API. The app resolver reads the run's playbook and org
-  profile on each activity, then assembles model, rendered prompt, tools, and
-  a lane-aware `ConfigPolicy`. Malformed persisted sections degrade to pack
-  defaults instead of bricking the loop. Case resolution is explicit through
+  service-job, and locked quote lanes; live/coming-soon blocks; per-stage
+  models; tool effects; and the fixed review policy. Customer communication
+  and case mutations require review; reads and narrow control/safety tools are
+  automatic but still use the Action pipeline. The resolver reads the run's
+  immutable pack binding, voice config, stage, and organization profile,
+  filters the registered toolset to that pack, and records content-addressed
+  prompt/policy/toolset versions. Invalid stored behavior fails closed. Case
+  resolution is explicit through
   `list_candidate_cases`, `select_case`, and `create_case`; `update_case`
   compare-and-sets the selected case with exact source-message provenance.
   `propose_response` is the single reviewed customer-facing unit and may carry
@@ -239,19 +256,32 @@ delivery-dependent run completion remain the next implementation slice.
   `POST /api/actions/{id}/decision`, `POST /api/conversations/{id}/reply`,
   `POST /api/conversations/{id}/acknowledge`, `GET /api/runs/{id}/events`,
   `GET /api/stats/decisions` (per-tool outcome rates + human-decision latency),
-  plus pack/playbook, organization-profile, and channel settings endpoints.
-  Settings writes are org-scoped, actor-attributed, command-idempotent CAS
-  operations; policy-floor violations return field-level 422 errors.
-- **Web UI:** one app-wide sidebar promotes Inbox, Playbooks, Knowledge,
+  plus singleton Agent Behavior, organization-profile, and channel settings
+  endpoints. A request principal supplies organization, actor, and role;
+  Agent Behavior writes are strict, actor-attributed, command-idempotent CAS
+  operations with field-level errors. Request middleware fails closed without
+  a `PrincipalProvider`; the binary intentionally installs a static development
+  principal until production identity integration exists.
+- **Web UI:** one app-wide sidebar promotes Inbox, Agent Behavior, Knowledge,
   Channels, and Insights. Inbox filters pending decisions and escalations,
   shows queue-wide pending count/worst wait, and opens the message thread with
   agent-draft review (approve / edit / revise / dismiss), case panel, customer
-  simulator sheet and `/insights` decision metrics. Playbooks expose
-  playbook lanes, approval policy with inline evidence, read-only actual
-  models per journey stage, and voice controls,
-  an honestly locked service catalog, channel routing/dev connections, and
-  organization knowledge. Conversation surfaces poll (1.5–5s); settings fetch
-  on mount and invalidate only after mutation.
+  simulator sheet and `/insights` decision metrics. Agent Behavior exposes a
+  fixed-review explanation and voice controls without pack, policy, or model
+  knobs. Channels automatically use the organization singleton, and the
+  simulator targets an explicit active development connection. Conversation
+  surfaces poll (1.5–5s); settings fetch on mount and invalidate only after
+  mutation.
+- **Schema/upgrade safety:** migration 0014 requires an explicit exactly-one
+  legacy playbook precondition instead of silently choosing/deleting records,
+  normalizes voice values, makes routing bindings required, and adds composite
+  same-organization foreign keys across domain, Action, transcript, outbox, and
+  model-turn relationships. New channel IDs remain server-generated ULIDs.
+- **Verified in database integration tests:** concurrent Agent Behavior command
+  replay, idempotency-key reuse, replayed version conflicts, singleton runtime
+  snapshots, canonical model responses, source provenance, stale route
+  rejection, cross-tenant constraints, channel ULIDs, and legacy-cardinality
+  migration failure.
 - **Verified live** (scripted LLM + real Temporal/Postgres): full
   propose→decide→execute loop incl. edits and rejection-revision; worker
   restart mid-run resumes with pending action intact; persistent threads with
@@ -269,32 +299,27 @@ as the contract.
 
 ## 6. Gaps to tackle next
 
-The 2026-07-10 correctness cutover retires the earlier itemized race ledger.
+The 2026-07-11 correctness cutover retires the earlier itemized race ledger.
 The remaining work is grouped by the boundary it completes.
 
 ### 6.1 Correctness / durability
 
 1. **Finish the coordinator cutover.** Activate `ConversationCoordinatorV2`,
-   drain outbox wakeups independently of the HTTP process, persist context
-   snapshots and model turns, and make run completion depend on confirmed
-   delivery. The schema seams exist; the active workflow is still run-scoped.
+   drain outbox wakeups independently of the HTTP process, and make run
+   completion depend on confirmed delivery. Context/model-turn persistence is
+   active; the workflow ownership boundary is still run-scoped.
 2. **Prove replay and race behavior.** Add Temporal tests for inbound arriving
    during review, duplicate decisions/replies, supersession, delivery failure,
    workflow replay, and outbox retries. These invariants are the product.
 
 ### 6.2 Trust boundary
 
-3. **Dispatcher impersonation via message text.** Dispatcher notes are a
-   plain-text label inside a user turn; a customer typing the same label
-   spoofs the dispatcher in the agent's context. Harmless while every
-   `propose_response` is reviewed; a live hole once anything auto-sends. Fix
-   structurally (delimit/escape customer text), not by prompt. (The briefing
-   assembled by `app/briefing` labels message text as data — same treatment
-   belongs on live turns.)
-4. **Org scoping is on tables, not queries.** Every by-ID read
-    (conversation, action, run, events) skips `org_id`; each new endpoint
-    copies the pattern and the retrofit bill grows. Move store signatures to
-    `(ctx, orgID, id)` now. (Also: CORS `*` is dev-only; don't ship it.)
+3. **Wire a production identity provider.** Request handling now derives
+   organization, actor, and role from a fail-closed `PrincipalProvider`, and
+   tenant relationships have composite database constraints. The binary still
+   installs an explicit static development principal; production session/token
+   verification is the remaining deployment integration. (CORS `*` remains
+   dev-only.)
 
 ### 6.3 Product gaps
 
@@ -318,27 +343,29 @@ The remaining work is grouped by the boundary it completes.
   LLM-generated summary can replace it behind the same
   `conversations.thread_summary` column when threads outgrow five lines.
 - **Pack SDK + second vertical** (was the future design 006): the delivered
-  registry now owns lanes, prompt rendering, per-stage models, policy parameters,
-  floors, and an honest catalog placeholder. Still missing are a registered
+  registry now owns lanes, prompt rendering, per-stage models, fixed effect
+  policy, and an honest catalog placeholder. Still missing are a registered
   case-schema/tool catalog that drives `update_case`, service-catalog wiring,
   and the pressure-test of a genuinely different second vertical.
 - **Post-intake runs** (scheduling, follow-up): new task kinds + case
   lifecycle states on the same Action/Policy machinery — new agents, not new
   architecture. Unblocked by run-per-task and triage.
-- **Auto-approval policy design:** per-org, per-lane Auto/Review/Forbid is now
-  live and clamped by code-owned floors, with org-wide per-tool evidence
-  inline. Follow-ups are lane-split decision stats and confidence/evaluation
-  signals that can justify moving a floor rather than merely exposing a knob.
+- **Auto-approval policy design:** intentionally deferred. V1 fixes customer
+  communication and case mutations at review; reads and control/safety tools
+  stay automatic. Reintroducing autonomy requires lane- and behavior-versioned
+  evidence plus an explicit product rollout, not a restored settings knob.
 - Smaller deferred items: unified customer-profile UI, identity merge/dedup,
-  auth/authz, real WhatsApp adapter (Meta Cloud API / Twilio), attention
+  production identity/session integration, real WhatsApp adapter (Meta Cloud
+  API / Twilio), attention
   moving from thread to case grain, decision timeouts (holding messages),
   per-agent turn budgets on `AgentDefinition`, config-revision history UI,
   service-catalog-to-intake wiring.
 
 ### Suggested sequence
 
-1. Finish the coordinator/outbox/model-turn cutover and its replay/race tests.
-2. Delimit untrusted message text and complete org-scoped reads.
+1. Finish the coordinator/outbox cutover and its replay/race tests; the legacy
+   loop now persists exact context/model turns as its compatibility substrate.
+2. Wire a production identity provider.
 3. Add real escalation notification before an unattended pilot.
 4. Remove the conversation-list N+1 queries; then build identity merge and
    audited customer-profile editing.

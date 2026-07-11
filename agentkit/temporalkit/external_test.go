@@ -32,3 +32,11 @@ func TestExternalTextPlain(t *testing.T) {
 		t.Errorf("ExternalText = %q, want %q", fenced, want)
 	}
 }
+
+func TestExternalTextWithIDExposesTrustedProvenance(t *testing.T) {
+	fenced := ExternalTextWithID("msg-01", "my sink is leaking")
+	want := `<external_message message_id="msg-01">` + "\nmy sink is leaking\n</external_message>"
+	if fenced != want {
+		t.Errorf("ExternalTextWithID = %q, want %q", fenced, want)
+	}
+}

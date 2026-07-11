@@ -89,6 +89,9 @@ func testEvent(orgID, runID string, typ agentkit.EventType, dedupeKey string) ag
 
 func newTestRun(t *testing.T, s *Postgres, orgID string) string {
 	t.Helper()
+	if _, err := s.pool.Exec(context.Background(), `INSERT INTO organizations(id,name) VALUES($1,$1) ON CONFLICT(id) DO NOTHING`, orgID); err != nil {
+		t.Fatalf("create organization: %v", err)
+	}
 	id := agentkit.NewID()
 	err := s.CreateRun(context.Background(), agentkit.Run{
 		ID: id, OrgID: orgID, Agent: "testagent", Status: agentkit.RunRunning,

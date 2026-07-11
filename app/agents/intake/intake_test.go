@@ -12,21 +12,21 @@ import (
 	"dispatch/app/packs"
 )
 
-// TestIntakePolicyRouting pins the v1 approval policy: internal, reversible
-// record-keeping auto-approves; anything customer-facing or terminal needs a
-// human, and unknown tools fall back to the safe default.
+// TestIntakePolicyRouting pins the v1 approval policy: customer communication
+// and business mutations require review, internal reads and controls are
+// automatic, and unknown tools are forbidden.
 func TestIntakePolicyRouting(t *testing.T) {
 	p := packs.Default()["field-service"]
-	effective := packs.EffectiveConfig(p, nil)
-	policy := packs.ConfigPolicy{Pack: p, Effective: effective}
+	policy := packs.ToolPolicy{Pack: p}
 	cases := map[string]agentkit.PolicyDecision{
 		"list_candidate_cases": agentkit.AutoApprove,
-		"select_case":          agentkit.AutoApprove,
-		"create_case":          agentkit.AutoApprove,
-		"update_case":          agentkit.AutoApprove,
+		"route_intent":         agentkit.AutoApprove,
+		"select_case":          agentkit.RequireApproval,
+		"create_case":          agentkit.RequireApproval,
+		"update_case":          agentkit.RequireApproval,
 		"escalate":             agentkit.AutoApprove,
 		"propose_response":     agentkit.RequireApproval,
-		"unknown_tool":         agentkit.RequireApproval, // default is the safe one
+		"unknown_tool":         agentkit.Forbid,
 	}
 	for tool, want := range cases {
 		if got := policy.Evaluate(context.Background(), agentkit.Action{Tool: tool}); got != want {
@@ -98,6 +98,45 @@ func TestScriptedYieldsAfterApproval(t *testing.T) {
 	}
 	if resp.StopReason != llm.StopEndTurn {
 		t.Errorf("stop reason = %s, want %s", resp.StopReason, llm.StopEndTurn)
+	}
+}
+
+func TestScriptedRoutesBeforeReplying(t *testing.T) {
+	firstMessages := []llm.Message{llm.UserText(temporalkit.ExternalTextWithID("msg-1", "What are your opening hours?"))}
+	first, err := ScriptedLLM{}.Complete(context.Background(), llm.CompletionRequest{Messages: firstMessages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	firstCalls := first.ToolCalls()
+	if len(firstCalls) != 1 || firstCalls[0].Name != "route_intent" {
+		t.Fatalf("first completion = %+v, want route_intent", firstCalls)
+	}
+	var route struct {
+		Lane             string   `json:"lane"`
+		SourceMessageIDs []string `json:"source_message_ids"`
+	}
+	if err := json.Unmarshal(firstCalls[0].Input, &route); err != nil {
+		t.Fatal(err)
+	}
+	if route.Lane != "inquiry" {
+		t.Fatalf("lane = %q, want inquiry", route.Lane)
+	}
+	if len(route.SourceMessageIDs) != 1 || route.SourceMessageIDs[0] != "msg-1" {
+		t.Fatalf("source_message_ids = %v, want [msg-1]", route.SourceMessageIDs)
+	}
+
+	secondMessages := append(firstMessages,
+		assistantToolUse(t, firstCalls[0].ID, firstCalls[0].Name, map[string]any{
+			"lane": "inquiry", "reason": "hours question", "source_message_ids": []string{"message-1"},
+		}),
+		llm.ToolResults(llm.ToolResult{ToolCallID: firstCalls[0].ID, Content: `{"stage":"inquiry"}`}))
+	second, err := ScriptedLLM{}.Complete(context.Background(), llm.CompletionRequest{Messages: secondMessages})
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondCalls := second.ToolCalls()
+	if len(secondCalls) != 1 || secondCalls[0].Name != "propose_response" {
+		t.Fatalf("second completion = %+v, want propose_response", secondCalls)
 	}
 }
 

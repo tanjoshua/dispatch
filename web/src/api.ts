@@ -141,8 +141,7 @@ export interface ConversationDetail {
 }
 
 // ToolDecisionStats mirrors agentkit.ToolDecisionStats: per-tool decision
-// outcomes and human-decision latency — the evidence the autonomy slider
-// (RequireApproval → AutoApprove) moves on.
+// outcomes and human-decision latency for evaluating the fixed product policy.
 export interface ToolDecisionStats {
   tool: string
   proposed: number
@@ -176,31 +175,45 @@ export class ApiError extends Error {
   constructor(message: string, status: number, body: unknown) { super(message); this.status = status; this.body = body }
 }
 
-export type PolicyValue = 'auto' | 'require_review' | 'forbid'
-export interface PackStage { id:string;label:string;description:string;model:string;status:'live'|'coming_soon' }
-export interface PackTool { name: string; label: string; risk: string; default: PolicyValue; settings: PolicyValue[] }
-export interface PackBlock { id: string; label: string; status: 'live' | 'coming_soon' }
-export interface PackLane { id: string; label: string; description: string; status: 'live' | 'coming_soon'; blocks: PackBlock[]; tools?: PackTool[] }
-export interface Pack { id: string; label: string; description: string; agent_name: string; lanes: PackLane[]; stages:PackStage[];default_model:string;catalog:{label:string;status:string;description:string} }
-export interface VoiceConfig { agent_name: string; tone: string; custom_instructions: string }
-export interface PlaybookConfig { schema:number;pack:string;models?:{per_stage?:Record<string,{override?:string}>};voice:VoiceConfig;policy:Record<string,Record<string,PolicyValue>> }
-export interface Playbook { id:string;org_id:string;name:string;agent:string;case_type:string;config:PlaybookConfig;version:number;created_at:string }
-export interface EffectiveTool {value:PolicyValue;source:string;locked:boolean}
-export interface EffectiveConfig { config:PlaybookConfig;policy:Record<string,Record<string,EffectiveTool>>;model:string;models:Record<string,string> }
+export interface AgentBehavior {
+  agent_name: string
+  tone: string
+  custom_instructions: string
+}
+
+export interface AgentBehaviorResponse {
+  behavior: AgentBehavior
+  version: number
+}
+
 export interface ProfileFact {id:string;label:string;text:string}
 export interface OrgProfile {business_name:string;hours:string;service_area:string;facts:ProfileFact[]}
-export interface ChannelConnection {id:string;org_id:string;kind:string;address:string;status:string;default_playbook_id:string;version:number;created_at:string}
+export interface ChannelConnection {id:string;org_id:string;kind:string;address:string;status:string;version:number;created_at:string}
 export interface ChannelKind {id:string;label:string;status:'available'|'coming_soon';description:string}
 
-export function getPacks(){return request<{packs:Pack[]}>('/api/packs')}
-export function listPlaybooks(){return request<{playbooks:Playbook[]}>('/api/playbooks')}
-export function getPlaybook(id:string){return request<{playbook:Playbook;effective:EffectiveConfig}>(`/api/playbooks/${id}`)}
-export function updatePlaybookConfig(playbook:Playbook,config:PlaybookConfig){return request<{playbook:Playbook;effective:EffectiveConfig}>(`/api/playbooks/${playbook.id}`,{method:'PATCH',body:JSON.stringify({command_id:crypto.randomUUID(),expected_version:playbook.version,config})})}
+export function getAgentBehavior() {
+  return request<AgentBehaviorResponse>('/api/org/agent-behavior')
+}
+
+export function updateAgentBehavior(input: {
+  behavior: AgentBehavior
+  expectedVersion: number
+  commandId: string
+}) {
+  return request<AgentBehaviorResponse>('/api/org/agent-behavior', {
+    method: 'PATCH',
+    body: JSON.stringify({
+      command_id: input.commandId,
+      expected_version: input.expectedVersion,
+      behavior: input.behavior,
+    }),
+  })
+}
+
 export function getOrgProfile(){return request<{profile:OrgProfile;version:number}>('/api/org/profile')}
 export function updateOrgProfile(profile:OrgProfile,expectedVersion:number){return request<{profile:OrgProfile;version:number}>('/api/org/profile',{method:'PATCH',body:JSON.stringify({command_id:crypto.randomUUID(),expected_version:expectedVersion,profile})})}
 export function listChannels(){return request<{connections:ChannelConnection[];kinds:ChannelKind[]}>('/api/channels')}
-export function createChannel(input:{kind:string;address:string;defaultPlaybookId:string}){const commandId=crypto.randomUUID();return request<ChannelConnection>('/api/channels',{method:'POST',body:JSON.stringify({command_id:commandId,kind:input.kind,address:input.address,default_playbook_id:input.defaultPlaybookId})})}
-export function updateChannel(connection:ChannelConnection,defaultPlaybookId:string){return request<ChannelConnection>(`/api/channels/${connection.id}`,{method:'PATCH',body:JSON.stringify({command_id:crypto.randomUUID(),expected_version:connection.version,default_playbook_id:defaultPlaybookId})})}
+export function createChannel(input:{kind:string;address:string;commandId:string}){return request<ChannelConnection>('/api/channels',{method:'POST',body:JSON.stringify({command_id:input.commandId,kind:input.kind,address:input.address})})}
 
 export function listConversations() {
   return request<{ conversations: ConversationSummary[] }>('/api/conversations')
@@ -214,10 +227,15 @@ export function getDecisionStats() {
   return request<{ tools: ToolDecisionStats[] }>('/api/stats/decisions')
 }
 
-export function sendInbound(input: { phone: string; name: string; text: string }) {
+export function sendInbound(input: { connectionId: string; phone: string; name: string; text: string }) {
   return request<{ conversation_id: string; run_id: string }>('/api/dev/inbound', {
     method: 'POST',
-    body: JSON.stringify(input),
+    body: JSON.stringify({
+      connection_id: input.connectionId,
+      phone: input.phone,
+      name: input.name,
+      text: input.text,
+    }),
   })
 }
 

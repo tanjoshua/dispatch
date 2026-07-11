@@ -64,11 +64,11 @@ func (s *Postgres) ProposeAction(ctx context.Context, action agentkit.Action, ev
 	}
 	err := s.inTx(ctx, func(tx pgx.Tx) error {
 		tag, err := tx.Exec(ctx, `
-			INSERT INTO actions (id, org_id, run_id, tool_call_id, tool, input, state, context_revision, dependency_versions, responds_through_event_seq)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
-			ON CONFLICT (run_id, tool_call_id) DO NOTHING`,
+				INSERT INTO actions (id, org_id, run_id, tool_call_id, tool, input, state, context_revision, dependency_versions, responds_through_event_seq, model_turn_id)
+				VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+				ON CONFLICT (run_id, tool_call_id) DO NOTHING`,
 			action.ID, action.OrgID, action.RunID, action.ToolCallID,
-			action.Tool, action.Input, action.State, action.ContextRevision, dependencies, nullInt64(action.RespondsThroughEventSeq))
+			action.Tool, action.Input, action.State, action.ContextRevision, dependencies, nullInt64(action.RespondsThroughEventSeq), nullIfEmpty(action.ModelTurnID))
 		if err != nil {
 			return err
 		}
@@ -263,7 +263,7 @@ const actionSelect = `
 	SELECT id, org_id, run_id, tool_call_id, tool, input, edited_input, state,
 	       decision_kind, decided_by, decision_reason, result, error,
 	       proposed_at, decided_at, executed_at, version, context_revision,
-	       dependency_versions, COALESCE(responds_through_event_seq,0)
+		       dependency_versions, COALESCE(responds_through_event_seq,0), COALESCE(model_turn_id,'')
 	FROM actions`
 
 func (s *Postgres) scanAction(row pgx.Row) (*agentkit.Action, error) {
@@ -273,7 +273,7 @@ func (s *Postgres) scanAction(row pgx.Row) (*agentkit.Action, error) {
 		&a.Input, &a.EditedInput, &a.State,
 		&decisionKind, &decidedBy, &decisionReason, &a.Result, &execErr,
 		&a.ProposedAt, &a.DecidedAt, &a.ExecutedAt, &a.Version,
-		&a.ContextRevision, &a.DependencyVersions, &a.RespondsThroughEventSeq)
+		&a.ContextRevision, &a.DependencyVersions, &a.RespondsThroughEventSeq, &a.ModelTurnID)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound

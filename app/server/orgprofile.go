@@ -31,7 +31,8 @@ func profileFromSettings(raw json.RawMessage) (orgProfile, map[string]json.RawMe
 	return p, bag
 }
 func (s *Server) handleGetOrgProfile(w http.ResponseWriter, r *http.Request) {
-	o, err := s.Domain.GetOrganization(r.Context(), s.DefaultOrgID, s.DefaultOrgID)
+	requestOrgID := orgID(r)
+	o, err := s.Domain.GetOrganization(r.Context(), requestOrgID, requestOrgID)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -52,7 +53,8 @@ func (s *Server) handleUpdateOrgProfile(w http.ResponseWriter, r *http.Request) 
 		writeError(w, 400, "invalid JSON")
 		return
 	}
-	o, err := s.Domain.GetOrganization(r.Context(), s.DefaultOrgID, s.DefaultOrgID)
+	requestOrgID := orgID(r)
+	o, err := s.Domain.GetOrganization(r.Context(), requestOrgID, requestOrgID)
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
@@ -66,9 +68,9 @@ func (s *Server) handleUpdateOrgProfile(w http.ResponseWriter, r *http.Request) 
 		writeError(w, 401, err.Error())
 		return
 	}
-	updated, err := s.Domain.UpdateOrganizationSettings(r.Context(), s.DefaultOrgID, req.ExpectedVersion, settings, req.CommandID, actor)
+	updated, err := s.Domain.UpdateOrganizationSettings(r.Context(), requestOrgID, req.ExpectedVersion, settings, req.CommandID, actor)
 	if errors.Is(err, domain.ErrVersionConflict) {
-		fresh, _ := s.Domain.GetOrganization(r.Context(), s.DefaultOrgID, s.DefaultOrgID)
+		fresh, _ := s.Domain.GetOrganization(r.Context(), requestOrgID, requestOrgID)
 		p, _ := profileFromSettings(fresh.Settings)
 		writeJSON(w, 409, map[string]any{"error": "version_conflict", "code": "version_conflict", "current": map[string]any{"profile": p, "version": fresh.Version}})
 		return

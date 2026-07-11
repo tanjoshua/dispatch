@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useNavigate } from '@tanstack/react-router'
-import { BarChart3Icon, BookOpenIcon, InboxIcon, LibraryIcon, MessageSquareMoreIcon, RadioIcon } from 'lucide-react'
+import { BarChart3Icon, BotIcon, InboxIcon, LibraryIcon, MessageSquareMoreIcon, RadioIcon } from 'lucide-react'
 import { listChannels, listConversations } from '@/api'
 import { Simulator } from '@/components/Simulator'
 import { Badge } from '@/components/ui/badge'
@@ -11,7 +11,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { waitingFor } from '@/lib/format'
 import { cn } from '@/lib/utils'
 
-const groups=[{label:'Operate',items:[['Inbox','/inbox',InboxIcon]]},{label:'Configure',items:[['Playbooks','/playbooks',BookOpenIcon],['Knowledge','/knowledge',LibraryIcon],['Channels','/channels',RadioIcon],['Insights','/insights',BarChart3Icon]]}] as const
+const groups=[{label:'Operate',items:[['Inbox','/inbox',InboxIcon]]},{label:'Configure',items:[['Agent Behavior','/agent-behavior',BotIcon],['Knowledge','/knowledge',LibraryIcon],['Channels','/channels',RadioIcon],['Insights','/insights',BarChart3Icon]]}] as const
 export function AppSidebar(){
  const [simulate,setSimulate]=useState(false);const navigate=useNavigate();
  const {data}=useQuery({queryKey:['conversations'],queryFn:listConversations,refetchInterval:3000});const channels=useQuery({queryKey:['channels'],queryFn:listChannels})

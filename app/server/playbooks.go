@@ -3,127 +3,175 @@ package server
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
-	"sort"
+	"strings"
+	"unicode/utf8"
 
 	"dispatch/app/domain"
-	"dispatch/app/packs"
 )
 
-func (s *Server) registry() packs.Registry {
-	if s.Packs == nil {
-		return packs.Default()
-	}
-	return s.Packs
+const settingsBodyLimit = 64 << 10
+
+type agentBehaviorResponse struct {
+	Behavior domain.AgentBehavior `json:"behavior"`
+	Version  int64                `json:"version"`
 }
 
-func (s *Server) handlePacks(w http.ResponseWriter, _ *http.Request) {
-	items := []packs.Pack{}
-	for _, p := range s.registry() {
-		items = append(items, p)
-	}
-	sort.Slice(items, func(i, j int) bool { return items[i].ID < items[j].ID })
-	writeJSON(w, http.StatusOK, map[string]any{"packs": items})
+type updateAgentBehaviorRequest struct {
+	CommandID       string               `json:"command_id"`
+	ExpectedVersion int64                `json:"expected_version"`
+	Behavior        domain.AgentBehavior `json:"behavior"`
 }
 
-func (s *Server) handleListPlaybooks(w http.ResponseWriter, r *http.Request) {
-	items, err := s.Domain.ListPlaybooks(r.Context(), s.DefaultOrgID)
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 200, map[string]any{"playbooks": items})
-}
-
-func packForConfig(reg packs.Registry, raw json.RawMessage, agent string) (packs.Pack, bool) {
-	var envelope struct {
-		Pack string `json:"pack"`
-	}
-	_ = json.Unmarshal(raw, &envelope)
-	if p, ok := reg[envelope.Pack]; ok {
-		return p, true
-	}
-	for _, p := range reg {
-		if p.AgentName == agent {
-			return p, true
-		}
-	}
-	return packs.Pack{}, false
-}
-
-func (s *Server) handleGetPlaybook(w http.ResponseWriter, r *http.Request) {
-	pb, err := s.Domain.GetPlaybookForOrg(r.Context(), s.DefaultOrgID, r.PathValue("id"))
+func (s *Server) handleGetAgentBehavior(w http.ResponseWriter, r *http.Request) {
+	pb, err := s.Domain.GetAgentBehavior(r.Context(), orgID(r))
 	if err != nil {
 		if errors.Is(err, domain.ErrNotFound) {
-			writeError(w, 404, "playbook not found")
-		} else {
-			writeError(w, 500, err.Error())
-		}
-		return
-	}
-	p, ok := packForConfig(s.registry(), pb.Config, pb.Agent)
-	if !ok {
-		writeError(w, 422, "playbook references an unavailable pack")
-		return
-	}
-	writeJSON(w, 200, map[string]any{"playbook": pb, "effective": packs.EffectiveConfig(p, pb.Config)})
-}
-
-type updatePlaybookRequest struct {
-	CommandID       string          `json:"command_id"`
-	ExpectedVersion int64           `json:"expected_version"`
-	Config          json.RawMessage `json:"config"`
-}
-
-func (s *Server) handleUpdatePlaybook(w http.ResponseWriter, r *http.Request) {
-	var req updatePlaybookRequest
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeError(w, 400, "invalid JSON")
-		return
-	}
-	current, err := s.Domain.GetPlaybookForOrg(r.Context(), s.DefaultOrgID, r.PathValue("id"))
-	if err != nil {
-		if errors.Is(err, domain.ErrNotFound) {
-			writeError(w, 404, "playbook not found")
-		} else {
-			writeError(w, 500, err.Error())
-		}
-		return
-	}
-	p, ok := packForConfig(s.registry(), req.Config, current.Agent)
-	if !ok {
-		writeJSON(w, 422, map[string]any{"error": "invalid_config", "fields": map[string]string{"pack": "unknown pack"}})
-		return
-	}
-	if err := packs.ValidateConfig(p, req.Config); err != nil {
-		if validation, ok := err.(*packs.ValidationError); ok {
-			writeJSON(w, 422, map[string]any{"error": "invalid_config", "fields": validation.Fields})
+			writeError(w, http.StatusNotFound, "agent behavior is not configured")
 			return
 		}
-		writeError(w, 422, err.Error())
+		writeError(w, http.StatusInternalServerError, "could not load agent behavior")
+		return
+	}
+	response, err := agentBehaviorFromPlaybook(pb)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "agent behavior configuration is invalid")
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
+}
+
+func (s *Server) handleUpdateAgentBehavior(w http.ResponseWriter, r *http.Request) {
+	var req updateAgentBehaviorRequest
+	if err := decodeStrictJSON(w, r, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		return
+	}
+	req.CommandID = strings.TrimSpace(req.CommandID)
+	req.Behavior = normalizeAgentBehavior(req.Behavior)
+	fields := validateAgentBehaviorRequest(req)
+	if len(fields) > 0 {
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+			"error":  "invalid_behavior",
+			"fields": fields,
+		})
 		return
 	}
 	actor, err := s.actor(r)
 	if err != nil {
-		writeError(w, 401, err.Error())
+		writeError(w, http.StatusUnauthorized, "actor unavailable")
 		return
 	}
-	updated, err := s.Domain.UpdatePlaybookConfig(r.Context(), s.DefaultOrgID, current.ID, req.ExpectedVersion, req.Config, req.CommandID, actor)
+	updated, err := s.Domain.UpdateAgentBehavior(
+		r.Context(), orgID(r), req.ExpectedVersion, req.Behavior, req.CommandID, actor,
+	)
 	if errors.Is(err, domain.ErrVersionConflict) {
-		fresh, _ := s.Domain.GetPlaybookForOrg(r.Context(), s.DefaultOrgID, current.ID)
-		writeJSON(w, 409, map[string]any{"error": "version_conflict", "code": "version_conflict", "current": fresh})
+		current, responseErr := agentBehaviorFromPlaybook(updated)
+		if responseErr != nil {
+			writeError(w, http.StatusInternalServerError, "could not load current agent behavior")
+			return
+		}
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error":   "version_conflict",
+			"code":    "version_conflict",
+			"current": current,
+		})
+		return
+	}
+	if errors.Is(err, domain.ErrIdempotencyKeyReuse) {
+		writeJSON(w, http.StatusConflict, map[string]string{
+			"error": "idempotency_key_reuse",
+			"code":  "idempotency_key_reuse",
+		})
+		return
+	}
+	if errors.Is(err, domain.ErrNotFound) {
+		writeError(w, http.StatusNotFound, "agent behavior is not configured")
 		return
 	}
 	if err != nil {
-		writeError(w, 500, err.Error())
+		writeError(w, http.StatusInternalServerError, "could not update agent behavior")
 		return
 	}
-	writeJSON(w, 200, map[string]any{"playbook": updated, "effective": packs.EffectiveConfig(p, updated.Config)})
+	response, err := agentBehaviorFromPlaybook(updated)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "could not load updated agent behavior")
+		return
+	}
+	writeJSON(w, http.StatusOK, response)
 }
 
-func (s *Server) actor(r *http.Request) (string, error) {
-	if s.ActorProvider == nil {
-		return StaticActorProvider("dispatcher:dev").ActorID(r)
+func agentBehaviorFromPlaybook(pb *domain.Playbook) (agentBehaviorResponse, error) {
+	if pb == nil {
+		return agentBehaviorResponse{}, errors.New("nil playbook")
 	}
-	return s.ActorProvider.ActorID(r)
+	var config struct {
+		Schema int                  `json:"schema"`
+		Voice  domain.AgentBehavior `json:"voice"`
+	}
+	if err := json.Unmarshal(pb.Config, &config); err != nil {
+		return agentBehaviorResponse{}, err
+	}
+	if config.Schema != 1 && config.Schema != 2 {
+		return agentBehaviorResponse{}, errors.New("unsupported behavior schema")
+	}
+	if fields := validateAgentBehavior(config.Voice); len(fields) > 0 {
+		return agentBehaviorResponse{}, errors.New("invalid behavior values")
+	}
+	return agentBehaviorResponse{Behavior: config.Voice, Version: pb.Version}, nil
+}
+
+func normalizeAgentBehavior(behavior domain.AgentBehavior) domain.AgentBehavior {
+	behavior.AgentName = strings.TrimSpace(behavior.AgentName)
+	behavior.Tone = strings.TrimSpace(behavior.Tone)
+	behavior.CustomInstructions = strings.TrimSpace(behavior.CustomInstructions)
+	return behavior
+}
+
+func validateAgentBehaviorRequest(req updateAgentBehaviorRequest) map[string]string {
+	fields := validateAgentBehavior(req.Behavior)
+	if req.CommandID == "" {
+		fields["command_id"] = "is required"
+	} else if len(req.CommandID) > 128 {
+		fields["command_id"] = "must be 128 characters or fewer"
+	}
+	if req.ExpectedVersion < 1 {
+		fields["expected_version"] = "must be at least 1"
+	}
+	return fields
+}
+
+func validateAgentBehavior(behavior domain.AgentBehavior) map[string]string {
+	fields := map[string]string{}
+	if behavior.AgentName == "" {
+		fields["agent_name"] = "is required"
+	} else if utf8.RuneCountInString(behavior.AgentName) > 80 {
+		fields["agent_name"] = "must be 80 characters or fewer"
+	}
+	if behavior.Tone == "" {
+		fields["tone"] = "is required"
+	} else if utf8.RuneCountInString(behavior.Tone) > 240 {
+		fields["tone"] = "must be 240 characters or fewer"
+	}
+	if utf8.RuneCountInString(behavior.CustomInstructions) > 4000 {
+		fields["custom_instructions"] = "must be 4000 characters or fewer"
+	}
+	return fields
+}
+
+func decodeStrictJSON(w http.ResponseWriter, r *http.Request, target any) error {
+	r.Body = http.MaxBytesReader(w, r.Body, settingsBodyLimit)
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
+		return err
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return errors.New("request body must contain one JSON object")
+		}
+		return err
+	}
+	return nil
 }

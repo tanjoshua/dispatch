@@ -16,7 +16,7 @@ type caseCorrectionRequest struct {
 
 func (s *Server) handleCaseCorrection(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	conv, err := s.Domain.GetConversation(ctx, s.DefaultOrgID, r.PathValue("id"))
+	conv, err := s.Domain.GetConversation(ctx, orgID(r), r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusNotFound, "conversation not found")
 		return
@@ -31,7 +31,7 @@ func (s *Server) handleCaseCorrection(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusConflict, "conversation has no run for case correction")
 		return
 	}
-	c, err := s.Domain.UpdateCase(ctx, runID, r.PathValue("caseID"), req.ExpectedVersion, req.Patch, req.SourceMessageIDs)
+	c, err := s.Domain.UpdateCase(ctx, runID, r.PathValue("caseID"), req.ExpectedVersion, req.Patch, req.SourceMessageIDs, "", conv.ContextRevision)
 	if errors.Is(err, domain.ErrVersionConflict) {
 		writeJSON(w, http.StatusConflict, map[string]string{"error": "version_conflict", "code": "version_conflict"})
 		return

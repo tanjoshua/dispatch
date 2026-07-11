@@ -14,10 +14,12 @@ import { Textarea } from '@/components/ui/textarea'
 // Sending hits the same inbound path a real WhatsApp webhook would — nothing
 // downstream knows the difference.
 export function CustomerComposer({
+	connectionId,
   phone,
   name,
   closed,
 }: {
+	connectionId: string
   phone?: string
   name?: string
   closed: boolean
@@ -38,7 +40,7 @@ export function CustomerComposer({
   const submit = () => {
     const body = text.trim()
     if (!body || !phone) return
-    send.mutate({ phone, name: name ?? '', text: body })
+		send.mutate({ connectionId, phone, name: name ?? '', text: body })
   }
 
   const cancel = () => {

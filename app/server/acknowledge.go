@@ -27,11 +27,14 @@ func (s *Server) handleAcknowledge(w http.ResponseWriter, r *http.Request) {
 	// Body is optional; ignore a decode error on an empty/malformed body and
 	// fall back to defaults.
 	_ = json.NewDecoder(r.Body).Decode(&req)
-	if req.AcknowledgedBy == "" {
-		req.AcknowledgedBy = "dispatcher"
+	actor, err := s.actor(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "actor unavailable")
+		return
 	}
+	req.AcknowledgedBy = actor
 
-	conv, err := s.Domain.GetConversation(ctx, s.DefaultOrgID, convID)
+	conv, err := s.Domain.GetConversation(ctx, orgID(r), convID)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "conversation not found")

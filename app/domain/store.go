@@ -179,9 +179,9 @@ func (s *Store) scanChannelConnection(row pgx.Row) (*ChannelConnection, error) {
 func (s *Store) GetPlaybook(ctx context.Context, id string) (*Playbook, error) {
 	var p Playbook
 	err := s.pool.QueryRow(ctx, `
-	SELECT id, org_id, name, agent, case_type, config, version, created_at
+	SELECT id, org_id, name, pack_id, agent, case_type, config, version, created_at
 		FROM playbooks WHERE id = $1`, id).
-		Scan(&p.ID, &p.OrgID, &p.Name, &p.Agent, &p.CaseType, &p.Config, &p.Version, &p.CreatedAt)
+		Scan(&p.ID, &p.OrgID, &p.Name, &p.PackID, &p.Agent, &p.CaseType, &p.Config, &p.Version, &p.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -384,23 +384,88 @@ func (s *Store) LatestRunIDForConversation(ctx context.Context, conversationID s
 // TransitionRunToInquiry advances a case-less run after its first inquiry
 // response is delivered. It is idempotent and never moves a run backwards.
 func (s *Store) TransitionRunToInquiry(ctx context.Context, runID string) error {
-	tx, err := s.pool.Begin(ctx); if err != nil { return err }; defer tx.Rollback(ctx)
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
 	var orgID, convID string
 	var changed bool
 	err = tx.QueryRow(ctx, `UPDATE run_bindings SET stage='inquiry'
 		WHERE run_id=$1 AND stage='triage' AND case_id IS NULL
-		RETURNING org_id,conversation_id,true`, runID).Scan(&orgID,&convID,&changed)
-	if errors.Is(err, pgx.ErrNoRows) { return tx.Commit(ctx) }
-	if err != nil { return err }
-	if changed { if err := appendConversationEvent(ctx,tx,orgID,convID,runID,"","run_stage_changed",nil,map[string]any{"from":"triage","to":"inquiry"}); err != nil { return err } }
+		RETURNING org_id,conversation_id,true`, runID).Scan(&orgID, &convID, &changed)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return tx.Commit(ctx)
+	}
+	if err != nil {
+		return err
+	}
+	if changed {
+		if err := appendConversationEvent(ctx, tx, orgID, convID, runID, "", "", "run_stage_changed", []string{}, map[string]any{"from": "triage", "to": "inquiry"}); err != nil {
+			return err
+		}
+	}
 	return tx.Commit(ctx)
 }
 
 func (s *Store) StageForRun(ctx context.Context, runID string) (string, error) {
 	var stage string
 	err := s.pool.QueryRow(ctx, `SELECT stage FROM run_bindings WHERE run_id=$1`, runID).Scan(&stage)
-	if errors.Is(err, pgx.ErrNoRows) { return "", ErrNotFound }
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", ErrNotFound
+	}
 	return stage, err
+}
+
+// RouteRunToLane records the code-owned triage decision. Runs may advance from
+// inquiry to service when a later message turns a question into real work, but
+// never move from service back to inquiry.
+func (s *Store) RouteRunToLane(ctx context.Context, runID, lane, reason string, sourceMessageIDs []string, actionID string, expectedContextRevision int64) error {
+	if lane != "inquiry" && lane != "service_job" {
+		return fmt.Errorf("domain: invalid run lane %q", lane)
+	}
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	if _, found, err := priorActionEvent(ctx, tx, actionID, "run_stage_changed"); err != nil {
+		return err
+	} else if found {
+		return tx.Commit(ctx)
+	}
+
+	var orgID, conversationID, current string
+	var contextRevision int64
+	if err := tx.QueryRow(ctx, `SELECT rb.org_id,rb.conversation_id,rb.stage,c.context_revision
+		FROM run_bindings rb JOIN conversations c ON c.id=rb.conversation_id AND c.org_id=rb.org_id
+		WHERE rb.run_id=$1 FOR UPDATE OF rb,c`, runID).
+		Scan(&orgID, &conversationID, &current, &contextRevision); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		return err
+	}
+	if contextRevision != expectedContextRevision {
+		return ErrVersionConflict
+	}
+	if current == lane {
+		return tx.Commit(ctx)
+	}
+	if current == "service_job" || (current != "triage" && current != "inquiry") {
+		return fmt.Errorf("domain: cannot route run from %s to %s", current, lane)
+	}
+	if current == "inquiry" && lane != "service_job" {
+		return fmt.Errorf("domain: cannot route run from %s to %s", current, lane)
+	}
+	if _, err := tx.Exec(ctx, `UPDATE run_bindings SET stage=$2 WHERE run_id=$1`, runID, lane); err != nil {
+		return err
+	}
+	if err := appendConversationEvent(ctx, tx, orgID, conversationID, runID, "", actionID, "run_stage_changed", sourceMessageIDs,
+		map[string]any{"from": current, "to": lane, "reason": reason}); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // RaiseEscalation projects an escalate action onto the conversation: it flags
@@ -808,27 +873,41 @@ func (s *Store) ActionContext(ctx context.Context, runID string) (int64, json.Ra
 
 // SelectCaseForRun explicitly binds an unbound run to a customer-owned case.
 // Completed cases are not reopened as a side effect.
-func (s *Store) SelectCaseForRun(ctx context.Context, runID, caseID, reason string, sourceMessageIDs []string) (*Case, error) {
+func (s *Store) SelectCaseForRun(ctx context.Context, runID, caseID, reason string, sourceMessageIDs []string, actionID string, expectedContextRevision int64) (*Case, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	var convID, orgID, customerID string
+	if priorCaseID, found, err := priorActionEvent(ctx, tx, actionID, "case_selected"); err != nil {
+		return nil, err
+	} else if found {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return s.GetCase(ctx, priorCaseID)
+	}
+	var convID, orgID, customerID, expectedCaseType string
+	var contextRevision int64
 	var bound *string
-	if err := tx.QueryRow(ctx, `SELECT rb.conversation_id, rb.org_id, rb.case_id, c.customer_id
-		FROM run_bindings rb JOIN conversations c ON c.id=rb.conversation_id
-		WHERE rb.run_id=$1 FOR UPDATE OF rb,c`, runID).Scan(&convID, &orgID, &bound, &customerID); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT rb.conversation_id,rb.org_id,rb.case_id,c.customer_id,pb.case_type,c.context_revision
+		FROM run_bindings rb
+		JOIN conversations c ON c.id=rb.conversation_id AND c.org_id=rb.org_id
+		JOIN playbooks pb ON pb.id=rb.playbook_id AND pb.org_id=rb.org_id
+		WHERE rb.run_id=$1 FOR UPDATE OF rb,c`, runID).Scan(&convID, &orgID, &bound, &customerID, &expectedCaseType, &contextRevision); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
+	if contextRevision != expectedContextRevision {
+		return nil, ErrVersionConflict
+	}
 	if bound != nil && *bound != caseID {
 		return nil, ErrCaseAlreadySelected
 	}
-	var owner, status string
-	if err := tx.QueryRow(ctx, `SELECT customer_id,status FROM cases WHERE id=$1 AND org_id=$2`, caseID, orgID).Scan(&owner, &status); err != nil {
+	var owner, status, caseType string
+	if err := tx.QueryRow(ctx, `SELECT customer_id,status,type FROM cases WHERE id=$1 AND org_id=$2`, caseID, orgID).Scan(&owner, &status, &caseType); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -837,13 +916,18 @@ func (s *Store) SelectCaseForRun(ctx context.Context, runID, caseID, reason stri
 	if owner != customerID {
 		return nil, fmt.Errorf("domain: case does not belong to resolved customer")
 	}
+	if caseType != expectedCaseType {
+		return nil, fmt.Errorf("domain: case type %q is incompatible with playbook case type %q", caseType, expectedCaseType)
+	}
 	if bound == nil {
 		if _, err := tx.Exec(ctx, `UPDATE run_bindings SET case_id=$2,stage='service_job' WHERE run_id=$1`, runID, caseID); err != nil {
 			return nil, err
 		}
-		if err := appendConversationEvent(ctx, tx, orgID, convID, runID, caseID, "run_stage_changed", sourceMessageIDs, map[string]any{"to":"service_job"}); err != nil { return nil, err }
+		if err := appendConversationEvent(ctx, tx, orgID, convID, runID, caseID, actionID, "run_stage_changed", sourceMessageIDs, map[string]any{"to": "service_job"}); err != nil {
+			return nil, err
+		}
 	}
-	if err := appendConversationEvent(ctx, tx, orgID, convID, runID, caseID, "case_selected", sourceMessageIDs, map[string]any{"reason": reason}); err != nil {
+	if err := appendConversationEvent(ctx, tx, orgID, convID, runID, caseID, actionID, "case_selected", sourceMessageIDs, map[string]any{"reason": reason}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -854,17 +938,27 @@ func (s *Store) SelectCaseForRun(ctx context.Context, runID, caseID, reason stri
 
 // CreateCaseForRun creates and selects a new case explicitly. It is idempotent
 // for an already-bound run and records the exact source messages.
-func (s *Store) CreateCaseForRun(ctx context.Context, runID string, fields json.RawMessage, sourceMessageIDs []string) (*Case, error) {
+func (s *Store) CreateCaseForRun(ctx context.Context, runID string, fields json.RawMessage, sourceMessageIDs []string, actionID string, expectedContextRevision int64) (*Case, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
+	if priorCaseID, found, err := priorActionEvent(ctx, tx, actionID, "case_created"); err != nil {
+		return nil, err
+	} else if found {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return s.GetCase(ctx, priorCaseID)
+	}
 	var convID, orgID, customerID, caseType string
+	var contextRevision int64
 	var bound *string
-	if err := tx.QueryRow(ctx, `SELECT rb.conversation_id,rb.org_id,rb.case_id,c.customer_id,COALESCE(pb.case_type,'field_service_job')
-		FROM run_bindings rb JOIN conversations c ON c.id=rb.conversation_id LEFT JOIN playbooks pb ON pb.id=rb.playbook_id
-		WHERE rb.run_id=$1 FOR UPDATE OF rb,c`, runID).Scan(&convID, &orgID, &bound, &customerID, &caseType); err != nil {
+	if err := tx.QueryRow(ctx, `SELECT rb.conversation_id,rb.org_id,rb.case_id,c.customer_id,pb.case_type,c.context_revision
+		FROM run_bindings rb JOIN conversations c ON c.id=rb.conversation_id AND c.org_id=rb.org_id
+		JOIN playbooks pb ON pb.id=rb.playbook_id AND pb.org_id=rb.org_id
+		WHERE rb.run_id=$1 FOR UPDATE OF rb,c`, runID).Scan(&convID, &orgID, &bound, &customerID, &caseType, &contextRevision); err != nil {
 		return nil, err
 	}
 	if bound != nil {
@@ -872,6 +966,9 @@ func (s *Store) CreateCaseForRun(ctx context.Context, runID string, fields json.
 			return nil, err
 		}
 		return s.GetCase(ctx, *bound)
+	}
+	if contextRevision != expectedContextRevision {
+		return nil, ErrVersionConflict
 	}
 	id := agentkit.NewID()
 	if len(fields) == 0 {
@@ -884,8 +981,10 @@ func (s *Store) CreateCaseForRun(ctx context.Context, runID string, fields json.
 	if _, err := tx.Exec(ctx, `UPDATE run_bindings SET case_id=$2,stage='service_job' WHERE run_id=$1`, runID, id); err != nil {
 		return nil, err
 	}
-	if err := appendConversationEvent(ctx, tx, orgID, convID, runID, id, "run_stage_changed", sourceMessageIDs, map[string]any{"to":"service_job"}); err != nil { return nil, err }
-	if err := appendConversationEvent(ctx, tx, orgID, convID, runID, id, "case_created", sourceMessageIDs, map[string]any{"initial_fields": fields}); err != nil {
+	if err := appendConversationEvent(ctx, tx, orgID, convID, runID, id, actionID, "run_stage_changed", sourceMessageIDs, map[string]any{"to": "service_job"}); err != nil {
+		return nil, err
+	}
+	if err := appendConversationEvent(ctx, tx, orgID, convID, runID, id, actionID, "case_created", sourceMessageIDs, map[string]any{"initial_fields": fields}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -896,16 +995,28 @@ func (s *Store) CreateCaseForRun(ctx context.Context, runID string, fields json.
 
 // UpdateCase applies a compare-and-set patch to one explicit customer-owned
 // case. Concurrent corrections never overwrite each other silently.
-func (s *Store) UpdateCase(ctx context.Context, runID, caseID string, expectedVersion int64, patch json.RawMessage, sourceMessageIDs []string) (*Case, error) {
+func (s *Store) UpdateCase(ctx context.Context, runID, caseID string, expectedVersion int64, patch json.RawMessage, sourceMessageIDs []string, actionID string, expectedContextRevision int64) (*Case, error) {
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	var convID, orgID, customerID string
-	if err := tx.QueryRow(ctx, `SELECT rb.conversation_id,rb.org_id,c.customer_id FROM run_bindings rb
-		JOIN conversations c ON c.id=rb.conversation_id WHERE rb.run_id=$1 FOR UPDATE OF c`, runID).Scan(&convID, &orgID, &customerID); err != nil {
+	if priorCaseID, found, err := priorActionEvent(ctx, tx, actionID, "case_updated"); err != nil {
 		return nil, err
+	} else if found {
+		if err := tx.Commit(ctx); err != nil {
+			return nil, err
+		}
+		return s.GetCase(ctx, priorCaseID)
+	}
+	var convID, orgID, customerID string
+	var contextRevision int64
+	if err := tx.QueryRow(ctx, `SELECT rb.conversation_id,rb.org_id,c.customer_id,c.context_revision FROM run_bindings rb
+		JOIN conversations c ON c.id=rb.conversation_id AND c.org_id=rb.org_id WHERE rb.run_id=$1 FOR UPDATE OF c`, runID).Scan(&convID, &orgID, &customerID, &contextRevision); err != nil {
+		return nil, err
+	}
+	if contextRevision != expectedContextRevision {
+		return nil, ErrVersionConflict
 	}
 	tag, err := tx.Exec(ctx, `UPDATE cases SET data=data||$4::jsonb,version=version+1,updated_at=now()
 		WHERE id=$1 AND org_id=$2 AND customer_id=$3 AND version=$5`, caseID, orgID, customerID, patch, expectedVersion)
@@ -920,7 +1031,7 @@ func (s *Store) UpdateCase(ctx context.Context, runID, caseID string, expectedVe
 		}
 		return nil, ErrVersionConflict
 	}
-	if err := appendConversationEvent(ctx, tx, orgID, convID, runID, caseID, "case_updated", sourceMessageIDs, map[string]any{"patch": patch, "expected_version": expectedVersion}); err != nil {
+	if err := appendConversationEvent(ctx, tx, orgID, convID, runID, caseID, actionID, "case_updated", sourceMessageIDs, map[string]any{"patch": patch, "expected_version": expectedVersion}); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(ctx); err != nil {
@@ -929,7 +1040,19 @@ func (s *Store) UpdateCase(ctx context.Context, runID, caseID string, expectedVe
 	return s.GetCase(ctx, caseID)
 }
 
-func appendConversationEvent(ctx context.Context, tx pgx.Tx, orgID, convID, runID, caseID, typ string, sourceIDs []string, payload any) error {
+func priorActionEvent(ctx context.Context, tx pgx.Tx, actionID, typ string) (string, bool, error) {
+	if actionID == "" {
+		return "", false, nil
+	}
+	var caseID string
+	err := tx.QueryRow(ctx, `SELECT COALESCE(case_id,'') FROM conversation_events WHERE action_id=$1 AND type=$2`, actionID, typ).Scan(&caseID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return "", false, nil
+	}
+	return caseID, err == nil, err
+}
+
+func appendConversationEvent(ctx context.Context, tx pgx.Tx, orgID, convID, runID, caseID, actionID, typ string, sourceIDs []string, payload any) error {
 	var seq int64
 	if err := tx.QueryRow(ctx, `UPDATE conversations SET event_seq=event_seq+1,context_revision=context_revision+1,updated_at=now()
 		WHERE id=$1 RETURNING event_seq`, convID).Scan(&seq); err != nil {
@@ -939,8 +1062,8 @@ func appendConversationEvent(ctx context.Context, tx pgx.Tx, orgID, convID, runI
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO conversation_events(id,org_id,conversation_id,seq,type,run_id,case_id,source_message_ids,payload)
-		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9)`, agentkit.NewID(), orgID, convID, seq, typ, nullIfEmpty(runID), nullIfEmpty(caseID), sourceIDs, raw)
+	_, err = tx.Exec(ctx, `INSERT INTO conversation_events(id,org_id,conversation_id,seq,type,run_id,case_id,action_id,source_message_ids,payload)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)`, agentkit.NewID(), orgID, convID, seq, typ, nullIfEmpty(runID), nullIfEmpty(caseID), nullIfEmpty(actionID), sourceIDs, raw)
 	return err
 }
 
@@ -950,115 +1073,6 @@ func appendConversationEvent(ctx context.Context, tx pgx.Tx, orgID, convID, runI
 func (s *Store) CurrentCaseForConversation(ctx context.Context, conversationID string) (*Case, error) {
 	return s.scanCase(s.pool.QueryRow(ctx,
 		caseSelect+` WHERE conversation_id = $1 ORDER BY created_at DESC LIMIT 1`, conversationID))
-}
-
-// UpsertCaseForRun creates the case the run is working (binding it to the run on
-// first call) if needed, then shallow-merges the patch into its Data bag
-// (top-level keys). The case belongs to the run, not the thread, so each intake
-// run produces its own case — the basis for many cases per thread
-// (design/004-domain-remodel.md §6). The patch is the playbook's case-schema
-// fields as raw JSON; the store stays schema-agnostic, so a playbook-driven
-// schema needs no store change (§5, §8).
-func (s *Store) UpsertCaseForRun(ctx context.Context, runID, orgID, conversationID string, patch json.RawMessage) (*Case, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	// Find the run's bound case, locking the binding so concurrent activity
-	// retries can't create two cases for one run. The case type is the run's
-	// playbook's case_type (design/004 §8), defaulting when no playbook is bound.
-	var caseID *string
-	var caseType string
-	if err := tx.QueryRow(ctx, `
-		SELECT rb.case_id, COALESCE(pb.case_type, 'field_service_job')
-		FROM run_bindings rb
-		LEFT JOIN playbooks pb ON pb.id = rb.playbook_id
-		WHERE rb.run_id = $1 FOR UPDATE OF rb`, runID).Scan(&caseID, &caseType); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("domain: no run binding for run %s", runID)
-		}
-		return nil, err
-	}
-	if caseID == nil {
-		id := agentkit.NewID()
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO cases (id, org_id, conversation_id, customer_id, type)
-			SELECT $1, $2, c.id, c.customer_id, $4
-			FROM conversations c WHERE c.id = $3`,
-			id, orgID, conversationID, caseType); err != nil {
-			return nil, err
-		}
-		if _, err := tx.Exec(ctx, `
-			UPDATE run_bindings SET case_id = $2, stage='service_job' WHERE run_id = $1`, runID, id); err != nil {
-			return nil, err
-		}
-		caseID = &id
-	}
-	if len(patch) > 0 {
-		if _, err := tx.Exec(ctx, `
-			UPDATE cases SET data = data || $2::jsonb, updated_at = now() WHERE id = $1`,
-			*caseID, patch); err != nil {
-			return nil, err
-		}
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return s.GetCase(ctx, *caseID)
-}
-
-// BindRunToLatestCase attaches an unbound run to the thread's most recent case
-// — the continue_case tool: the run's work targets that case instead of
-// opening a new one, and a completed case reopens for intake. Idempotent under
-// activity retries: a run already bound returns its bound case unchanged.
-func (s *Store) BindRunToLatestCase(ctx context.Context, runID string) (*Case, error) {
-	tx, err := s.pool.Begin(ctx)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback(ctx)
-
-	var conversationID string
-	var boundCaseID *string
-	if err := tx.QueryRow(ctx, `
-		SELECT conversation_id, case_id FROM run_bindings
-		WHERE run_id = $1 FOR UPDATE`, runID).Scan(&conversationID, &boundCaseID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("domain: no run binding for run %s", runID)
-		}
-		return nil, err
-	}
-	if boundCaseID != nil {
-		if err := tx.Commit(ctx); err != nil {
-			return nil, err
-		}
-		return s.GetCase(ctx, *boundCaseID)
-	}
-
-	var caseID string
-	if err := tx.QueryRow(ctx, `
-		SELECT id FROM cases WHERE conversation_id = $1
-		ORDER BY created_at DESC LIMIT 1`, conversationID).Scan(&caseID); err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, fmt.Errorf("domain: no previous case on this thread to continue")
-		}
-		return nil, err
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE run_bindings SET case_id = $2, stage='service_job' WHERE run_id = $1`, runID, caseID); err != nil {
-		return nil, err
-	}
-	if _, err := tx.Exec(ctx, `
-		UPDATE cases SET status = 'intake', updated_at = now()
-		WHERE id = $1 AND status = 'intake_complete'`, caseID); err != nil {
-		return nil, err
-	}
-	if err := tx.Commit(ctx); err != nil {
-		return nil, err
-	}
-	return s.GetCase(ctx, caseID)
 }
 
 // threadSummaryLines caps the rolling summary: enough for a briefing to cover

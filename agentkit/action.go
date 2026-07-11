@@ -92,6 +92,7 @@ type Action struct {
 	Version                 int64           `json:"version"`
 	ContextRevision         int64           `json:"context_revision"`
 	DependencyVersions      json.RawMessage `json:"dependency_versions,omitempty"`
+	ModelTurnID             string          `json:"model_turn_id,omitempty"`
 	RespondsThroughEventSeq int64           `json:"responds_through_event_seq,omitempty"`
 	ProposedAt              time.Time       `json:"proposed_at"`
 	DecidedAt               *time.Time      `json:"decided_at,omitempty"`
@@ -107,11 +108,11 @@ func (a *Action) EffectiveInput() json.RawMessage {
 	return a.Input
 }
 
-// ToolDecisionStats aggregates one tool's decision outcomes and latency — the
-// evidence the autonomy slider moves on. A tool that humans approve unedited
-// 98% of the time at painful latency is a candidate for auto-approval; one
-// that keeps getting edited is not. Latency figures cover human decisions
-// only (policy auto-decisions are instant and would flatter the numbers).
+// ToolDecisionStats aggregates one tool's decision outcomes and latency. It is
+// evaluation evidence for product-level policy changes; organization settings
+// do not directly move tools between review and auto-approval. Latency figures
+// cover human decisions only (policy auto-decisions are instant and would
+// flatter the numbers).
 type ToolDecisionStats struct {
 	Tool              string     `json:"tool"`
 	Proposed          int        `json:"proposed"`

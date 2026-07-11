@@ -35,6 +35,7 @@ func New(tc temporalclient.Client, pool *pgxpool.Pool, llmClient llm.LLM, notifi
 		Store:         store.NewPostgres(pool),
 		Agents:        resolver,
 		ActionContext: appStore.ActionContext,
+		ModelTurns:    appStore,
 		// A tripped turn budget means the agent was acting without a human in
 		// the path; flag the conversation so a dispatcher engages (the same
 		// attention projection + notification path the escalate tool uses).

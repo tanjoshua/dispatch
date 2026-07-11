@@ -4,6 +4,7 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -17,7 +18,6 @@ import (
 	akstore "dispatch/agentkit/store"
 	"dispatch/app/channel"
 	"dispatch/app/domain"
-	"dispatch/app/packs"
 )
 
 type Server struct {
@@ -28,59 +28,127 @@ type Server struct {
 	// Sender is the shared outbound path, used when a dispatcher replies to the
 	// customer directly (design/003-dispatcher-as-participant.md). It is the same
 	// path the agent's send_message tool uses.
-	Sender *channel.Sender
-	// DefaultOrgID scopes the read API (conversation list) until auth lands (a
-	// 000 §8 non-goal). The inbound path no longer reads an org global — it
-	// resolves org from the channel connection (design/002).
-	DefaultOrgID  string
-	ActorProvider ActorProvider
-	Packs         packs.Registry
+	Sender            *channel.Sender
+	PrincipalProvider PrincipalProvider
 }
 
-// ActorProvider is the authentication seam for audit attribution. Development
-// uses a configured actor; production can replace it without changing command
-// payloads or trusting client-supplied identities.
-type ActorProvider interface {
-	ActorID(*http.Request) (string, error)
-}
-type StaticActorProvider string
+type Role string
 
-func (p StaticActorProvider) ActorID(*http.Request) (string, error) {
-	if p == "" {
-		return "dispatcher:dev", nil
+const (
+	RoleMember     Role = "member"
+	RoleAdmin      Role = "admin"
+	RoleDispatcher Role = "dispatcher"
+)
+
+// Principal is the authenticated organization and actor for one request.
+// Client payloads never provide either value.
+type Principal struct {
+	OrgID   string
+	ActorID string
+	Roles   []Role
+}
+
+func (p Principal) HasRole(role Role) bool {
+	for _, candidate := range p.Roles {
+		if candidate == RoleAdmin || candidate == role {
+			return true
+		}
 	}
-	return string(p), nil
+	return false
+}
+
+// PrincipalProvider is the authentication seam. Production implementations
+// resolve a session/token; development opts into StaticPrincipalProvider.
+type PrincipalProvider interface {
+	ResolvePrincipal(*http.Request) (Principal, error)
+}
+
+type StaticPrincipalProvider struct {
+	Principal Principal
+}
+
+func (p StaticPrincipalProvider) ResolvePrincipal(*http.Request) (Principal, error) {
+	if p.Principal.OrgID == "" || p.Principal.ActorID == "" {
+		return Principal{}, errors.New("static principal is incomplete")
+	}
+	return p.Principal, nil
 }
 
 func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
-	mux.HandleFunc("POST /api/dev/inbound", s.handleDevInbound)
-	mux.HandleFunc("POST /api/simulate/inbound", s.handleDevInbound) // deprecated alias (design/002 §9)
-	mux.HandleFunc("GET /api/conversations", s.handleListConversations)
-	mux.HandleFunc("GET /api/conversations/{id}", s.handleGetConversation)
-	mux.HandleFunc("POST /api/actions/{id}/decision", s.handleDecision)
-	mux.HandleFunc("POST /api/conversations/{id}/reply", s.handleDispatcherReply)
-	mux.HandleFunc("POST /api/conversations/{id}/cases/{caseID}/correction", s.handleCaseCorrection)
-	mux.HandleFunc("POST /api/conversations/{id}/acknowledge", s.handleAcknowledge)
-	mux.HandleFunc("GET /api/runs/{id}/events", s.handleRunEvents)
-	mux.HandleFunc("GET /api/stats/decisions", s.handleDecisionStats)
-	mux.HandleFunc("GET /api/packs", s.handlePacks)
-	mux.HandleFunc("GET /api/playbooks", s.handleListPlaybooks)
-	mux.HandleFunc("GET /api/playbooks/{id}", s.handleGetPlaybook)
-	mux.HandleFunc("PATCH /api/playbooks/{id}", s.handleUpdatePlaybook)
-	mux.HandleFunc("GET /api/org/profile", s.handleGetOrgProfile)
-	mux.HandleFunc("PATCH /api/org/profile", s.handleUpdateOrgProfile)
-	mux.HandleFunc("GET /api/channels", s.handleListChannels)
-	mux.HandleFunc("POST /api/channels", s.handleCreateChannel)
-	mux.HandleFunc("PATCH /api/channels/{id}", s.handleUpdateChannel)
-	return cors(mux)
+	mux.Handle("POST /api/dev/inbound", s.require(RoleDispatcher, http.HandlerFunc(s.handleDevInbound)))
+	mux.Handle("POST /api/simulate/inbound", s.require(RoleDispatcher, http.HandlerFunc(s.handleDevInbound))) // deprecated alias
+	mux.Handle("GET /api/conversations", s.require(RoleMember, http.HandlerFunc(s.handleListConversations)))
+	mux.Handle("GET /api/conversations/{id}", s.require(RoleMember, http.HandlerFunc(s.handleGetConversation)))
+	mux.Handle("POST /api/actions/{id}/decision", s.require(RoleDispatcher, http.HandlerFunc(s.handleDecision)))
+	mux.Handle("POST /api/conversations/{id}/reply", s.require(RoleDispatcher, http.HandlerFunc(s.handleDispatcherReply)))
+	mux.Handle("POST /api/conversations/{id}/cases/{caseID}/correction", s.require(RoleDispatcher, http.HandlerFunc(s.handleCaseCorrection)))
+	mux.Handle("POST /api/conversations/{id}/acknowledge", s.require(RoleDispatcher, http.HandlerFunc(s.handleAcknowledge)))
+	mux.Handle("GET /api/runs/{id}/events", s.require(RoleMember, http.HandlerFunc(s.handleRunEvents)))
+	mux.Handle("GET /api/stats/decisions", s.require(RoleMember, http.HandlerFunc(s.handleDecisionStats)))
+	mux.Handle("GET /api/org/agent-behavior", s.require(RoleMember, http.HandlerFunc(s.handleGetAgentBehavior)))
+	mux.Handle("PATCH /api/org/agent-behavior", s.require(RoleAdmin, http.HandlerFunc(s.handleUpdateAgentBehavior)))
+	mux.Handle("GET /api/org/profile", s.require(RoleMember, http.HandlerFunc(s.handleGetOrgProfile)))
+	mux.Handle("PATCH /api/org/profile", s.require(RoleAdmin, http.HandlerFunc(s.handleUpdateOrgProfile)))
+	mux.Handle("GET /api/channels", s.require(RoleMember, http.HandlerFunc(s.handleListChannels)))
+	mux.Handle("POST /api/channels", s.require(RoleAdmin, http.HandlerFunc(s.handleCreateChannel)))
+	return cors(s.authenticate(mux))
 }
 
-// handleDecisionStats serves per-tool decision outcomes and human-decision
-// latency — the evidence for moving tools between RequireApproval and
-// AutoApprove (OVERVIEW §6.3 #14).
+type principalContextKey struct{}
+
+func (s *Server) authenticate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if s.PrincipalProvider == nil {
+			writeError(w, http.StatusInternalServerError, "authentication is not configured")
+			return
+		}
+		principal, err := s.PrincipalProvider.ResolvePrincipal(r)
+		if err != nil || principal.OrgID == "" || principal.ActorID == "" {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		next.ServeHTTP(w, r.WithContext(context.WithValue(r.Context(), principalContextKey{}, principal)))
+	})
+}
+
+func (s *Server) require(role Role, next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		principal, ok := principalForRequest(r)
+		if !ok {
+			writeError(w, http.StatusUnauthorized, "authentication required")
+			return
+		}
+		if !principal.HasRole(role) {
+			writeError(w, http.StatusForbidden, "insufficient permissions")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func principalForRequest(r *http.Request) (Principal, bool) {
+	principal, ok := r.Context().Value(principalContextKey{}).(Principal)
+	return principal, ok
+}
+
+func (s *Server) actor(r *http.Request) (string, error) {
+	principal, ok := principalForRequest(r)
+	if !ok {
+		return "", errors.New("principal unavailable")
+	}
+	return principal.ActorID, nil
+}
+
+func orgID(r *http.Request) string {
+	principal, _ := principalForRequest(r)
+	return principal.OrgID
+}
+
+// handleDecisionStats serves per-tool outcomes and human-decision latency as
+// evaluation evidence for future product-level policy changes.
 func (s *Server) handleDecisionStats(w http.ResponseWriter, r *http.Request) {
-	stats, err := s.Agentkit.DecisionStats(r.Context(), s.DefaultOrgID)
+	stats, err := s.Agentkit.DecisionStats(r.Context(), orgID(r))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -101,7 +169,7 @@ func cors(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
 		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+		w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -145,7 +213,8 @@ type conversationSummary struct {
 
 func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	convs, err := s.Domain.ListConversations(ctx, s.DefaultOrgID)
+	requestOrgID := orgID(r)
+	convs, err := s.Domain.ListConversations(ctx, requestOrgID)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -162,7 +231,7 @@ func (s *Server) handleListConversations(w http.ResponseWriter, r *http.Request)
 			sum.LastMessage = &msgs[len(msgs)-1]
 		}
 		if runID, err := s.Domain.LatestRunIDForConversation(ctx, c.ID); err == nil && runID != "" {
-			actions, err := s.Agentkit.ListActionsByRun(ctx, s.DefaultOrgID, runID)
+			actions, err := s.Agentkit.ListActionsByRun(ctx, requestOrgID, runID)
 			if err == nil {
 				for _, a := range actions {
 					if a.State == agentkit.ActionPendingApproval {
@@ -197,7 +266,8 @@ type conversationDetail struct {
 
 func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
-	conv, err := s.Domain.GetConversation(ctx, s.DefaultOrgID, r.PathValue("id"))
+	requestOrgID := orgID(r)
+	conv, err := s.Domain.GetConversation(ctx, requestOrgID, r.PathValue("id"))
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "conversation not found")
@@ -220,16 +290,26 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 	}
 	if runID, err := s.Domain.LatestRunIDForConversation(ctx, conv.ID); err == nil && runID != "" {
 		detail.CurrentStage, _ = s.Domain.StageForRun(ctx, runID)
-		if events, err := s.Agentkit.ListEventsByRun(ctx, s.DefaultOrgID, runID); err == nil {
-			for i := len(events)-1; i >= 0; i-- { if events[i].Type == agentkit.EventLLMCompleted { var usage struct{Model string `json:"model"`}; if json.Unmarshal(events[i].Payload,&usage)==nil { detail.LastModel=usage.Model }; break } }
+		if events, err := s.Agentkit.ListEventsByRun(ctx, requestOrgID, runID); err == nil {
+			for i := len(events) - 1; i >= 0; i-- {
+				if events[i].Type == agentkit.EventLLMCompleted {
+					var usage struct {
+						Model string `json:"model"`
+					}
+					if json.Unmarshal(events[i].Payload, &usage) == nil {
+						detail.LastModel = usage.Model
+					}
+					break
+				}
+			}
 		}
 		if c, err := s.Domain.SelectedCaseForRun(ctx, runID); err == nil {
 			detail.Case = c
 		}
-		if run, err := s.Agentkit.GetRun(ctx, s.DefaultOrgID, runID); err == nil {
+		if run, err := s.Agentkit.GetRun(ctx, requestOrgID, runID); err == nil {
 			detail.Run = run
 		}
-		if actions, err := s.Agentkit.ListActionsByRun(ctx, s.DefaultOrgID, runID); err == nil {
+		if actions, err := s.Agentkit.ListActionsByRun(ctx, requestOrgID, runID); err == nil {
 			detail.Actions = actions
 			for i := range actions {
 				if actions[i].State == agentkit.ActionPendingApproval && (actions[i].Tool == "propose_response" || actions[i].Tool == "send_message") {
@@ -243,7 +323,7 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleRunEvents(w http.ResponseWriter, r *http.Request) {
-	events, err := s.Agentkit.ListEventsByRun(r.Context(), s.DefaultOrgID, r.PathValue("id"))
+	events, err := s.Agentkit.ListEventsByRun(r.Context(), orgID(r), r.PathValue("id"))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

@@ -16,7 +16,6 @@ import (
 	"dispatch/app/channel"
 	"dispatch/app/channel/dev"
 	"dispatch/app/domain"
-	"dispatch/app/packs"
 	"dispatch/app/server"
 )
 
@@ -48,14 +47,16 @@ func main() {
 	akStore := akstore.NewPostgres(pool)
 	sender := channel.NewSender(domainStore, channel.NewRegistry(dev.New(domainStore)))
 	srv := &server.Server{
-		Domain:        domainStore,
-		Agentkit:      akStore,
-		Temporal:      tc,
-		Router:        channel.NewRouter(domainStore, akStore, tc, app.TaskQueue, intake.AgentName),
-		Sender:        sender,
-		DefaultOrgID:  app.OrgID,
-		ActorProvider: server.StaticActorProvider(env("DISPATCH_DEV_ACTOR", "dispatcher:dev")),
-		Packs:         packs.Default(),
+		Domain:   domainStore,
+		Agentkit: akStore,
+		Temporal: tc,
+		Router:   channel.NewRouter(domainStore, akStore, tc, app.TaskQueue, intake.AgentName),
+		Sender:   sender,
+		PrincipalProvider: server.StaticPrincipalProvider{Principal: server.Principal{
+			OrgID:   app.OrgID,
+			ActorID: env("DISPATCH_DEV_ACTOR", "dispatcher:dev"),
+			Roles:   []server.Role{server.RoleMember, server.RoleAdmin, server.RoleDispatcher},
+		}},
 	}
 
 	log.Printf("api server listening on :%s", port)

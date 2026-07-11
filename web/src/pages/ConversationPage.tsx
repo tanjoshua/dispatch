@@ -282,6 +282,7 @@ export function ConversationPage() {
                     )
                   })}
                   <CustomerComposer
+					connectionId={data.conversation.channel_id}
                     phone={data.contact}
                     name={data.customer?.name}
                     closed={closed}

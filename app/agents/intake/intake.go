@@ -13,6 +13,7 @@ const AgentName = "intake"
 
 func Tools(store *domain.Store, sender *channel.Sender, notifier notify.Notifier) agentkit.ToolSet {
 	return agentkit.NewToolSet(
+		&routeIntentTool{store: store},
 		&listCandidateCasesTool{store: store},
 		&selectCaseTool{store: store},
 		&createCaseTool{store: store},

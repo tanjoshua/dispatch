@@ -1,15 +1,21 @@
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import { PlusIcon, TriangleAlertIcon } from 'lucide-react'
-import { listConversations } from '../api'
+import { listChannels, listConversations } from '../api'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
+import { Simulator } from '@/components/Simulator'
 import { waitingFor } from '@/lib/format'
 import { cn } from '@/lib/utils'
 import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 
 export function ConversationList() {
 	const navigate=useNavigate();const filter=useRouterState({select:s=>new URLSearchParams(s.location.searchStr).get('filter')??'all'})
+  const [simulate, setSimulate] = useState(false)
+  const channels = useQuery({ queryKey: ['channels'], queryFn: listChannels })
+  const hasDev = channels.data?.connections.some((c) => c.kind === 'dev' && c.status === 'active')
   const { data } = useQuery({
     queryKey: ['conversations'],
     queryFn: listConversations,
@@ -23,12 +29,12 @@ export function ConversationList() {
         <span className="font-mono text-[11px] font-medium tracking-widest text-muted-foreground uppercase">
           Conversations
         </span>
-        <Link to="/inbox">
-          <Button variant="outline" size="xs">
+        {hasDev && (
+          <Button variant="outline" size="xs" onClick={() => setSimulate(true)}>
             <PlusIcon data-icon="inline-start" />
             New
           </Button>
-        </Link>
+        )}
       </div>
       <div className="px-3 pb-2"><ToggleGroup value={[filter]} onValueChange={v=>v[0]&&navigate({to:'/inbox',search:{filter:v[0] as 'all'|'needs_decision'|'escalated'}})} variant="outline" size="sm" spacing={0} className="w-full"><ToggleGroupItem value="needs_decision">Needs decision</ToggleGroupItem><ToggleGroupItem value="escalated">Escalated</ToggleGroupItem><ToggleGroupItem value="all">All</ToggleGroupItem></ToggleGroup></div>
       {conversations.length === 0 && (
@@ -96,6 +102,22 @@ export function ConversationList() {
           )
         })}
       </ul>
+      <Sheet open={simulate} onOpenChange={setSimulate}>
+        <SheetContent>
+          <SheetHeader>
+            <SheetTitle>Simulate customer</SheetTitle>
+            <SheetDescription>Send a message through the development channel.</SheetDescription>
+          </SheetHeader>
+          <div className="p-4">
+            <Simulator
+              onStarted={(id) => {
+                setSimulate(false)
+                navigate({ to: '/inbox/$conversationId', params: { conversationId: id } })
+              }}
+            />
+          </div>
+        </SheetContent>
+      </Sheet>
     </div>
   )
 }

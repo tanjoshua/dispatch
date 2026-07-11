@@ -11,13 +11,26 @@ import (
 )
 
 // unfence strips the ExternalText delimiters a real model is told to treat as
-// data boundaries, so the script keys on the customer's actual words.
-func unfence(text string) string {
-	open, close := "<"+temporalkit.ExternalMessageTag+">", "</"+temporalkit.ExternalMessageTag+">"
+// data boundaries and returns the trusted message ID on the opening tag.
+func unfence(text string) (string, string) {
+	open, close := "<"+temporalkit.ExternalMessageTag, "</"+temporalkit.ExternalMessageTag+">"
 	text = strings.TrimSpace(text)
-	text = strings.TrimPrefix(text, open)
+	messageID := ""
+	if strings.HasPrefix(text, open) {
+		if end := strings.Index(text, ">"); end >= 0 {
+			tag := text[:end+1]
+			const attribute = `message_id="`
+			if start := strings.Index(tag, attribute); start >= 0 {
+				value := tag[start+len(attribute):]
+				if quote := strings.Index(value, `"`); quote >= 0 {
+					messageID = value[:quote]
+				}
+			}
+			text = text[end+1:]
+		}
+	}
 	text = strings.TrimSuffix(text, close)
-	return strings.TrimSpace(text)
+	return strings.TrimSpace(text), messageID
 }
 
 // ScriptedLLM is a deterministic stand-in for a real model, used for demos
@@ -29,15 +42,26 @@ type ScriptedLLM struct{}
 func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.CompletionResponse, error) {
 	userTurns := 0
 	lastText := ""
+	lastMessageID := ""
 	toolCalls := 0
+	lastTool := ""
+	routed := false
 	for _, m := range req.Messages {
 		for _, b := range m.Content {
 			switch {
 			case m.Role == llm.RoleUser && b.Type == "text":
 				userTurns++
-				lastText = unfence(b.Text)
+				text, messageID := unfence(b.Text)
+				lastText = text
+				if messageID != "" {
+					lastMessageID = messageID
+				}
 			case m.Role == llm.RoleAssistant && b.Type == "tool_use":
 				toolCalls++
+				if b.ToolCall != nil {
+					lastTool = b.ToolCall.Name
+					routed = routed || b.ToolCall.Name == "route_intent"
+				}
 			}
 		}
 	}
@@ -62,7 +86,7 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 	hasToolResults := lastRole == llm.RoleUser && len(req.Messages) > 0 &&
 		len(req.Messages[len(req.Messages)-1].Content) > 0 &&
 		req.Messages[len(req.Messages)-1].Content[0].Type == "tool_result"
-	if hasToolResults && !rejected {
+	if hasToolResults && !rejected && lastTool != "route_intent" {
 		return &llm.CompletionResponse{
 			Content:    []llm.ContentBlock{{Type: "text", Text: "(waiting for the customer)"}},
 			StopReason: llm.StopEndTurn,
@@ -75,10 +99,10 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 		return llm.ContentBlock{Type: "tool_use", ToolCall: &llm.ToolCall{ID: id(n), Name: name, Input: raw}}
 	}
 	reply := func(text string) llm.ContentBlock {
-		return call(0, "propose_response", map[string]any{"message": text, "responds_through_event_seq": userTurns, "after_delivery": map[string]any{"complete_run": false, "mark_intake_complete": false, "summary": ""}})
+		return call(0, "propose_response", map[string]any{"message": text, "after_delivery": map[string]any{"complete_run": false, "mark_intake_complete": false, "summary": ""}})
 	}
 	inquiryReply := func(text string) llm.ContentBlock {
-		return call(0, "propose_response", map[string]any{"message": text, "responds_through_event_seq": userTurns, "after_delivery": map[string]any{"complete_run": true, "mark_intake_complete": false, "summary": ""}})
+		return call(0, "propose_response", map[string]any{"message": text, "after_delivery": map[string]any{"complete_run": true, "mark_intake_complete": false, "summary": ""}})
 	}
 
 	var content []llm.ContentBlock
@@ -95,6 +119,19 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 				"category": "emergency",
 			}),
 		}
+	case !routed:
+		lane := "service_job"
+		if strings.Contains(strings.ToLower(lastText), "hours") || strings.Contains(strings.ToLower(lastText), "open") {
+			lane = "inquiry"
+		}
+		sourceMessageIDs := []string{}
+		if lastMessageID != "" {
+			sourceMessageIDs = append(sourceMessageIDs, lastMessageID)
+		}
+		content = []llm.ContentBlock{call(0, "route_intent", map[string]any{
+			"lane": lane, "reason": "scripted intent classification",
+			"source_message_ids": sourceMessageIDs,
+		})}
 	// The deterministic demo cannot read organization config. This branch is
 	// intentionally representative only; grounding is verified with a real LLM.
 	case strings.Contains(strings.ToLower(lastText), "hours") || strings.Contains(strings.ToLower(lastText), "open"):

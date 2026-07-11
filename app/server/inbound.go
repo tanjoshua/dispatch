@@ -7,12 +7,14 @@ import (
 
 	"dispatch/app/channel"
 	"dispatch/app/channel/dev"
+	"dispatch/app/domain"
 )
 
 type devInboundRequest struct {
-	Phone string `json:"phone"`
-	Name  string `json:"name"`
-	Text  string `json:"text"`
+	ConnectionID string `json:"connection_id,omitempty"`
+	Phone        string `json:"phone"`
+	Name         string `json:"name"`
+	Text         string `json:"text"`
 	// ProviderMessageID optionally simulates a transport message ID so the
 	// inbound dedupe path (webhook retries) can be exercised on the dev channel.
 	ProviderMessageID string `json:"provider_message_id,omitempty"`
@@ -38,13 +40,41 @@ func (s *Server) handleDevInbound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	conn, err := s.Domain.GetChannelConnectionByAddress(ctx, dev.Name, dev.Address)
+	var conn *domain.ChannelConnection
+	var err error
+	if strings.TrimSpace(req.ConnectionID) != "" {
+		conn, err = s.Domain.GetChannelConnection(ctx, strings.TrimSpace(req.ConnectionID))
+	} else {
+		connections, listErr := s.Domain.ListChannelConnections(ctx, orgID(r))
+		if listErr != nil {
+			writeError(w, http.StatusInternalServerError, listErr.Error())
+			return
+		}
+		for i := range connections {
+			candidate := &connections[i]
+			if candidate.Kind != dev.Name || candidate.Status != "active" {
+				continue
+			}
+			if conn != nil {
+				writeError(w, http.StatusBadRequest, "connection_id is required when multiple development connections are active")
+				return
+			}
+			conn = candidate
+		}
+		if conn == nil {
+			err = domain.ErrNotFound
+		}
+	}
 	if err != nil {
 		if isNotFound(err) {
-			writeError(w, http.StatusInternalServerError, "dev channel connection not seeded")
+			writeError(w, http.StatusNotFound, "development channel connection not found")
 			return
 		}
 		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if conn.OrgID != orgID(r) || conn.Kind != dev.Name || conn.Status != "active" {
+		writeError(w, http.StatusNotFound, "dev channel connection not found")
 		return
 	}
 

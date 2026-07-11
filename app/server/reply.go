@@ -29,6 +29,7 @@ type dispatcherReplyRequest struct {
 func (s *Server) handleDispatcherReply(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	convID := r.PathValue("id")
+	requestOrgID := orgID(r)
 
 	var req dispatcherReplyRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -44,17 +45,13 @@ func (s *Server) handleDispatcherReply(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "command_id is required")
 		return
 	}
-	actorProvider := s.ActorProvider
-	if actorProvider == nil {
-		actorProvider = StaticActorProvider("dispatcher:dev")
-	}
-	actor, err := actorProvider.ActorID(r)
+	actor, err := s.actor(r)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "actor unavailable")
 		return
 	}
 
-	conv, err := s.Domain.GetConversation(ctx, s.DefaultOrgID, convID)
+	conv, err := s.Domain.GetConversation(ctx, requestOrgID, convID)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "conversation not found")
@@ -121,7 +118,7 @@ func (s *Server) handleDispatcherReply(w http.ResponseWriter, r *http.Request) {
 	// Inform the agent — but only if there is a live run to receive it. A reply
 	// on a finished run is delivered and recorded; there is simply no agent to
 	// signal (design/003 §8).
-	if runID != "" && s.runIsLive(ctx, runID) {
+	if runID != "" && s.runIsLive(ctx, requestOrgID, runID) {
 		if err := s.Temporal.SignalWorkflow(ctx, agentkit.WorkflowID(runID), "",
 			temporalkit.SignalDispatcherMessage,
 			temporalkit.DispatcherMessageSignal{MessageID: msgID, Text: req.Text}); err != nil {
@@ -138,7 +135,7 @@ func (s *Server) handleDispatcherReply(w http.ResponseWriter, r *http.Request) {
 
 // runIsLive reports whether the run's workflow is still running, so a signal
 // won't error against a completed workflow.
-func (s *Server) runIsLive(ctx context.Context, runID string) bool {
-	run, err := s.Agentkit.GetRun(ctx, s.DefaultOrgID, runID)
+func (s *Server) runIsLive(ctx context.Context, orgID, runID string) bool {
+	run, err := s.Agentkit.GetRun(ctx, orgID, runID)
 	return err == nil && run.Status == agentkit.RunRunning
 }

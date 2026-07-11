@@ -56,14 +56,39 @@ type AgentDefinition struct {
 	Tools     agentkit.ToolSet
 	Policy    agentkit.Policy
 	// Tags are application-supplied, business-agnostic usage dimensions.
-	Tags      map[string]string
+	Tags map[string]string
+	// Snapshot is the application-owned version basis captured with the
+	// resolved prompt/config. Keeping it on the definition prevents a second,
+	// mutable read from pairing an old request with new freshness metadata.
+	Snapshot *AgentSnapshot
 	// TerminalTools names tools whose successful execution completes the
 	// run (e.g. an intake agent's close_case).
 	TerminalTools []string
+	// PauseTools names tools whose successful execution ends the current agent
+	// turn without completing the run. The workflow waits for new context.
+	PauseTools []string
+}
+
+// AgentSnapshot is an opaque application version basis attached to a resolved
+// agent definition. agentkit records and propagates it but does not interpret
+// the dependency document.
+type AgentSnapshot struct {
+	ContextRevision    int64
+	EventToSeq         int64
+	DependencyVersions json.RawMessage
 }
 
 func (d AgentDefinition) isTerminal(tool string) bool {
 	for _, t := range d.TerminalTools {
+		if t == tool {
+			return true
+		}
+	}
+	return false
+}
+
+func (d AgentDefinition) isPause(tool string) bool {
+	for _, t := range d.PauseTools {
 		if t == tool {
 			return true
 		}
@@ -115,6 +140,10 @@ type AgentLoopInput struct {
 	// inbound backlog, the last turn's tool results); the next completion
 	// flushes it. Small by construction; carried across ContinueAsNew.
 	PendingMessages []llm.Message `json:"pending_messages,omitempty"`
+	// PendingMessageIDs identifies the external messages represented by
+	// PendingMessages so a context snapshot retains exact provenance across a
+	// ContinueAsNew boundary.
+	PendingMessageIDs []string `json:"pending_message_ids,omitempty"`
 
 	// ProcessedMessageIDs carries the IDs of customer/dispatcher messages
 	// already absorbed into Messages. Channel adapters re-signal on duplicate

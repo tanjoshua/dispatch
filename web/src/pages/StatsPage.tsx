@@ -4,9 +4,8 @@ import { Badge } from '@/components/ui/badge'
 import { duration, toolLabel, waitingFor } from '@/lib/format'
 
 // Decision stats: per-tool outcomes and human-decision latency. This is the
-// evidence for moving a tool between "review everything" and auto-approval —
-// a tool humans approve unedited nearly always, at painful latency, is a
-// candidate; one that keeps getting edited or rejected is not.
+// evidence for evaluating the fixed review policy. Policy is not configurable
+// by an organization; any future autonomy change is a product rollout.
 export function StatsPage() {
   const { data } = useQuery({
     queryKey: ['decision-stats'],
@@ -22,8 +21,8 @@ export function StatsPage() {
       </h1>
       <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
         How the review queue is behaving, per tool: what humans approve, edit,
-        or reject, and how long decisions wait. This is the evidence the
-        approval policy moves on.
+        or reject, and how long decisions wait. Approval policy is fixed today;
+        these results inform any future product-level autonomy rollout.
       </p>
 
       {tools.length === 0 ? (

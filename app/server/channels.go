@@ -1,72 +1,75 @@
 package server
 
 import (
-	"encoding/json"
 	"errors"
 	"net/http"
 	"strings"
+	"time"
 
 	"dispatch/app/channel"
 	"dispatch/app/domain"
 )
 
 func (s *Server) handleListChannels(w http.ResponseWriter, r *http.Request) {
-	items, err := s.Domain.ListChannelConnections(r.Context(), s.DefaultOrgID)
+	items, err := s.Domain.ListChannelConnections(r.Context(), orgID(r))
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, map[string]any{"connections": items, "kinds": channel.Kinds()})
+	connections := make([]channelResponse, 0, len(items))
+	for _, item := range items {
+		connections = append(connections, channelResponseFromDomain(item))
+	}
+	writeJSON(w, 200, map[string]any{"connections": connections, "kinds": channel.Kinds()})
+}
+
+type channelResponse struct {
+	ID        string    `json:"id"`
+	OrgID     string    `json:"org_id"`
+	Kind      string    `json:"kind"`
+	Address   string    `json:"address"`
+	Status    string    `json:"status"`
+	Version   int64     `json:"version"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
+func channelResponseFromDomain(connection domain.ChannelConnection) channelResponse {
+	return channelResponse{
+		ID: connection.ID, OrgID: connection.OrgID, Kind: connection.Kind,
+		Address: connection.Address, Status: connection.Status,
+		Version: connection.Version, CreatedAt: connection.CreatedAt,
+	}
 }
 
 type createChannelRequest struct {
-	CommandID         string `json:"command_id"`
-	Kind              string `json:"kind"`
-	Address           string `json:"address"`
-	DefaultPlaybookID string `json:"default_playbook_id"`
+	CommandID string `json:"command_id"`
+	Kind      string `json:"kind"`
+	Address   string `json:"address"`
 }
 
 func (s *Server) handleCreateChannel(w http.ResponseWriter, r *http.Request) {
 	var req createChannelRequest
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
+	if decodeStrictJSON(w, r, &req) != nil {
 		writeError(w, 400, "invalid JSON")
 		return
+	}
+	req.CommandID = strings.TrimSpace(req.CommandID)
+	req.Kind = strings.TrimSpace(req.Kind)
+	req.Address = strings.TrimSpace(req.Address)
+	fields := map[string]string{}
+	if req.CommandID == "" {
+		fields["command_id"] = "is required"
+	} else if len(req.CommandID) > 128 {
+		fields["command_id"] = "must be 128 characters or fewer"
 	}
 	if req.Kind != "dev" {
-		writeJSON(w, 422, map[string]any{"error": "coming soon", "fields": map[string]string{"kind": "this channel kind is coming soon"}})
-		return
+		fields["kind"] = "this channel kind is coming soon"
 	}
-	if strings.TrimSpace(req.Address) == "" {
-		writeJSON(w, 422, map[string]any{"error": "invalid_channel", "fields": map[string]string{"address": "is required"}})
-		return
+	if req.Address == "" {
+		fields["address"] = "is required"
 	}
-	actor, err := s.actor(r)
-	if err != nil {
-		writeError(w, 401, err.Error())
-		return
-	}
-	c, err := s.Domain.CreateChannelConnection(r.Context(), domain.ChannelConnection{ID: req.CommandID, OrgID: s.DefaultOrgID, Kind: req.Kind, Address: req.Address, DefaultPlaybookID: req.DefaultPlaybookID}, req.CommandID, actor)
-	if errors.Is(err, domain.ErrNotFound) {
-		writeError(w, 422, "playbook does not belong to organization")
-		return
-	}
-	if err != nil {
-		writeError(w, 500, err.Error())
-		return
-	}
-	writeJSON(w, 201, c)
-}
-
-type updateChannelRequest struct {
-	CommandID         string `json:"command_id"`
-	ExpectedVersion   int64  `json:"expected_version"`
-	DefaultPlaybookID string `json:"default_playbook_id"`
-}
-
-func (s *Server) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
-	var req updateChannelRequest
-	if json.NewDecoder(r.Body).Decode(&req) != nil {
-		writeError(w, 400, "invalid JSON")
+	if len(fields) > 0 {
+		writeJSON(w, 422, map[string]any{"error": "invalid_channel", "fields": fields})
 		return
 	}
 	actor, err := s.actor(r)
@@ -74,25 +77,20 @@ func (s *Server) handleUpdateChannel(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, err.Error())
 		return
 	}
-	c, err := s.Domain.UpdateChannelConnectionPlaybook(r.Context(), s.DefaultOrgID, r.PathValue("id"), req.DefaultPlaybookID, req.ExpectedVersion, req.CommandID, actor)
-	if errors.Is(err, domain.ErrVersionConflict) {
-		connections, _ := s.Domain.ListChannelConnections(r.Context(), s.DefaultOrgID)
-		var current *domain.ChannelConnection
-		for i := range connections {
-			if connections[i].ID == r.PathValue("id") {
-				current = &connections[i]
-			}
-		}
-		writeJSON(w, 409, map[string]any{"error": "version_conflict", "code": "version_conflict", "current": current})
+	c, err := s.Domain.CreateChannelConnection(r.Context(), domain.ChannelConnection{
+		OrgID: orgID(r), Kind: req.Kind, Address: req.Address,
+	}, req.CommandID, actor)
+	if errors.Is(err, domain.ErrNotFound) {
+		writeError(w, 422, "agent behavior is not configured for organization")
 		return
 	}
-	if errors.Is(err, domain.ErrNotFound) {
-		writeError(w, 404, "channel or playbook not found")
+	if errors.Is(err, domain.ErrIdempotencyKeyReuse) {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "idempotency_key_reuse", "code": "idempotency_key_reuse"})
 		return
 	}
 	if err != nil {
 		writeError(w, 500, err.Error())
 		return
 	}
-	writeJSON(w, 200, c)
+	writeJSON(w, 201, channelResponseFromDomain(*c))
 }

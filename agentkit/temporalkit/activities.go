@@ -27,6 +27,40 @@ type Activities struct {
 	// ActionContext supplies application-owned freshness dependencies without
 	// making agentkit import the application domain.
 	ActionContext func(ctx context.Context, runID string) (revision int64, dependencies json.RawMessage, err error)
+	// ModelTurns persists the exact request before a provider call and its
+	// response afterward. Implementations dedupe by (run, sequence), preventing
+	// a retry after a provider response from issuing a second model call.
+	ModelTurns ModelTurnRecorder
+}
+
+type ModelTurnRecord struct {
+	CandidateID          string                `json:"candidate_id"`
+	RunID                string                `json:"run_id"`
+	OrgID                string                `json:"org_id"`
+	Seq                  int                   `json:"seq"`
+	Agent                string                `json:"agent"`
+	Request              llm.CompletionRequest `json:"request"`
+	Tags                 map[string]string     `json:"tags,omitempty"`
+	ContextRevision      int64                 `json:"context_revision"`
+	EventToSeq           int64                 `json:"event_to_seq"`
+	TriggeringMessageIDs []string              `json:"triggering_message_ids,omitempty"`
+	DependencyVersions   json.RawMessage       `json:"dependency_versions,omitempty"`
+}
+
+type PreparedModelTurn struct {
+	ID                 string                  `json:"id"`
+	Response           *llm.CompletionResponse `json:"response,omitempty"`
+	ContextRevision    int64                   `json:"context_revision,omitempty"`
+	EventToSeq         int64                   `json:"event_to_seq,omitempty"`
+	DependencyVersions json.RawMessage         `json:"dependency_versions,omitempty"`
+}
+
+type ModelTurnRecorder interface {
+	PrepareModelTurn(context.Context, ModelTurnRecord) (*PreparedModelTurn, error)
+	// CompleteModelTurn stores the first response and returns that canonical
+	// response. Overlapping retries may call a provider twice, but only one
+	// answer can reach the transcript and resulting Actions.
+	CompleteModelTurn(context.Context, string, *llm.CompletionResponse) (*llm.CompletionResponse, error)
 }
 
 func (a *Activities) agent(ctx context.Context, orgID, runID, name string) (AgentDefinition, error) {
@@ -57,36 +91,33 @@ type CompleteInput struct {
 	// appended after the agent definition's system prompt — definition first
 	// so the most stable text leads (prompt caching).
 	SystemContext string `json:"system_context,omitempty"`
+	// TriggeringMessageIDs are the persisted external messages carried by the
+	// delta. They are stored with the context snapshot for audit/provenance.
+	TriggeringMessageIDs []string `json:"triggering_message_ids,omitempty"`
 }
 
 // CompleteResult carries the model's reply plus the transcript length after
 // this completion (Delta, plus the assistant turn when one was recorded) —
 // the workflow's BaseSeq for the next call.
 type CompleteResult struct {
-	Response      *llm.CompletionResponse `json:"response"`
-	TranscriptLen int                     `json:"transcript_len"`
+	Response           *llm.CompletionResponse `json:"response"`
+	TranscriptLen      int                     `json:"transcript_len"`
+	ModelTurnID        string                  `json:"model_turn_id,omitempty"`
+	ContextRevision    int64                   `json:"context_revision,omitempty"`
+	EventToSeq         int64                   `json:"event_to_seq,omitempty"`
+	DependencyVersions json.RawMessage         `json:"dependency_versions,omitempty"`
 }
 
 func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*CompleteResult, error) {
-	def, err := a.agent(ctx, in.OrgID, in.RunID, in.Agent)
-	if err != nil {
-		return nil, err
-	}
 	if err := a.Store.AppendRunMessages(ctx, in.RunID, in.OrgID, in.BaseSeq, in.Delta); err != nil {
 		return nil, err
 	}
 	assistantSeq := in.BaseSeq + len(in.Delta)
-
-	// A retried activity whose first attempt already recorded the assistant
-	// turn returns the stored turn: the transcript is the truth, and a second
-	// LLM call would both cost money and diverge from what was persisted.
-	if stored, ok, err := a.Store.GetRunMessage(ctx, in.RunID, assistantSeq); err != nil {
+	// Resolve after the delta is durable. Application resolvers attach a prompt
+	// and freshness snapshot produced by one consistent database read.
+	def, err := a.agent(ctx, in.OrgID, in.RunID, in.Agent)
+	if err != nil {
 		return nil, err
-	} else if ok {
-		return &CompleteResult{
-			Response:      &llm.CompletionResponse{Content: stored.Content, StopReason: llm.StopOther},
-			TranscriptLen: assistantSeq + 1,
-		}, nil
 	}
 
 	messages, err := a.Store.ListRunMessages(ctx, in.RunID, assistantSeq)
@@ -97,16 +128,76 @@ func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*CompleteR
 	if in.SystemContext != "" {
 		system += "\n\n" + in.SystemContext
 	}
-	started := time.Now()
-	resp, err := a.LLM.Complete(ctx, llm.CompletionRequest{
+	request := llm.CompletionRequest{
 		Model:     def.Model,
 		System:    system,
 		Messages:  messages,
 		Tools:     def.toolDefs(),
 		MaxTokens: def.MaxTokens,
-	})
-	if err != nil {
+	}
+	var contextRevision int64
+	var eventToSeq int64
+	var dependencies json.RawMessage
+	if def.Snapshot != nil {
+		contextRevision = def.Snapshot.ContextRevision
+		eventToSeq = def.Snapshot.EventToSeq
+		dependencies = def.Snapshot.DependencyVersions
+	} else if a.ActionContext != nil {
+		contextRevision, dependencies, err = a.ActionContext(ctx, in.RunID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	modelTurnID := ""
+	var preparedResponse *llm.CompletionResponse
+	if a.ModelTurns != nil {
+		candidateID := agentkit.NewID()
+		prepared, err := a.ModelTurns.PrepareModelTurn(ctx, ModelTurnRecord{
+			CandidateID: candidateID, RunID: in.RunID, OrgID: in.OrgID, Seq: in.Seq,
+			Agent: in.Agent, Request: request, Tags: def.Tags,
+			ContextRevision: contextRevision, EventToSeq: eventToSeq,
+			TriggeringMessageIDs: in.TriggeringMessageIDs, DependencyVersions: dependencies,
+		})
+		if err != nil {
+			return nil, err
+		}
+		modelTurnID, preparedResponse = prepared.ID, prepared.Response
+		contextRevision, eventToSeq, dependencies = prepared.ContextRevision, prepared.EventToSeq, prepared.DependencyVersions
+	}
+
+	// A retried activity whose first attempt already recorded the assistant
+	// turn returns the stored turn. The prepared model turn still supplies the
+	// immutable dependency snapshot for actions from that completion.
+	if stored, ok, err := a.Store.GetRunMessage(ctx, in.RunID, assistantSeq); err != nil {
 		return nil, err
+	} else if ok {
+		resp := preparedResponse
+		if resp == nil {
+			resp = &llm.CompletionResponse{Content: stored.Content, StopReason: llm.StopOther}
+			if a.ModelTurns != nil {
+				resp, err = a.ModelTurns.CompleteModelTurn(ctx, modelTurnID, resp)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		return &CompleteResult{Response: resp, TranscriptLen: assistantSeq + 1, ModelTurnID: modelTurnID,
+			ContextRevision: contextRevision, EventToSeq: eventToSeq, DependencyVersions: dependencies}, nil
+	}
+
+	started := time.Now()
+	resp := preparedResponse
+	if resp == nil {
+		resp, err = a.LLM.Complete(ctx, request)
+		if err != nil {
+			return nil, err
+		}
+		if a.ModelTurns != nil {
+			resp, err = a.ModelTurns.CompleteModelTurn(ctx, modelTurnID, resp)
+			if err != nil {
+				return nil, err
+			}
+		}
 	}
 	// Usage lands in the event log as it happens — it is the billing/eval/cost
 	// substrate and cannot be backfilled. It goes in before the assistant turn:
@@ -115,9 +206,11 @@ func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*CompleteR
 	payload := map[string]any{
 		"model": def.Model, "input_tokens": resp.Usage.InputTokens,
 		"output_tokens": resp.Usage.OutputTokens, "stop_reason": resp.StopReason,
-		"seq": in.Seq, "duration_ms": time.Since(started).Milliseconds(),
+		"seq": in.Seq, "duration_ms": time.Since(started).Milliseconds(), "model_turn_id": modelTurnID,
 	}
-	for key, value := range def.Tags { payload[key] = value }
+	for key, value := range def.Tags {
+		payload[key] = value
+	}
 	if err := a.Store.AppendEvent(ctx, event(in.OrgID, in.RunID,
 		agentkit.EventLLMCompleted, fmt.Sprintf("llm_completed:%d", in.Seq),
 		payload)); err != nil {
@@ -133,7 +226,8 @@ func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*CompleteR
 		}
 		transcriptLen = assistantSeq + 1
 	}
-	return &CompleteResult{Response: resp, TranscriptLen: transcriptLen}, nil
+	return &CompleteResult{Response: resp, TranscriptLen: transcriptLen, ModelTurnID: modelTurnID,
+		ContextRevision: contextRevision, EventToSeq: eventToSeq, DependencyVersions: dependencies}, nil
 }
 
 // TurnBudgetExceededInput records that a turn hit MaxLLMCallsPerTurn. Seq is
@@ -190,10 +284,14 @@ func (a *Activities) RecordDroppedDecision(ctx context.Context, in DroppedDecisi
 // ProposeActionInput records one proposed tool call and runs it through the
 // policy. Idempotent on (RunID, ToolCall.ID).
 type ProposeActionInput struct {
-	RunID string       `json:"run_id"`
-	OrgID string       `json:"org_id"`
-	Agent string       `json:"agent"`
-	Call  llm.ToolCall `json:"call"`
+	RunID              string          `json:"run_id"`
+	OrgID              string          `json:"org_id"`
+	Agent              string          `json:"agent"`
+	Call               llm.ToolCall    `json:"call"`
+	ModelTurnID        string          `json:"model_turn_id,omitempty"`
+	ContextRevision    int64           `json:"context_revision,omitempty"`
+	EventToSeq         int64           `json:"event_to_seq,omitempty"`
+	DependencyVersions json.RawMessage `json:"dependency_versions,omitempty"`
 }
 
 // ProposeAction creates the Action record, appends action_proposed, and
@@ -207,15 +305,19 @@ func (a *Activities) ProposeAction(ctx context.Context, in ProposeActionInput) (
 	}
 
 	action := agentkit.Action{
-		ID:         agentkit.NewID(),
-		OrgID:      in.OrgID,
-		RunID:      in.RunID,
-		ToolCallID: in.Call.ID,
-		Tool:       in.Call.Name,
-		Input:      in.Call.Input,
-		State:      agentkit.ActionPendingApproval,
+		ID:          agentkit.NewID(),
+		OrgID:       in.OrgID,
+		RunID:       in.RunID,
+		ToolCallID:  in.Call.ID,
+		Tool:        in.Call.Name,
+		Input:       in.Call.Input,
+		State:       agentkit.ActionPendingApproval,
+		ModelTurnID: in.ModelTurnID,
 	}
-	if a.ActionContext != nil {
+	if in.ModelTurnID != "" {
+		action.ContextRevision = in.ContextRevision
+		action.DependencyVersions = in.DependencyVersions
+	} else if a.ActionContext != nil {
 		rev, deps, err := a.ActionContext(ctx, in.RunID)
 		if err != nil {
 			return nil, err
@@ -224,15 +326,20 @@ func (a *Activities) ProposeAction(ctx context.Context, in ProposeActionInput) (
 		action.DependencyVersions = deps
 	}
 	if in.Call.Name == "propose_response" {
-		var p struct {
-			RespondsThroughEventSeq int64 `json:"responds_through_event_seq"`
+		action.RespondsThroughEventSeq = in.EventToSeq
+		if action.RespondsThroughEventSeq == 0 {
+			// Compatibility for pre-versioned workflows whose model supplied the
+			// cursor directly. New workflows always use the model-turn snapshot.
+			var p struct {
+				RespondsThroughEventSeq int64 `json:"responds_through_event_seq"`
+			}
+			_ = json.Unmarshal(in.Call.Input, &p)
+			action.RespondsThroughEventSeq = p.RespondsThroughEventSeq
 		}
-		_ = json.Unmarshal(in.Call.Input, &p)
-		action.RespondsThroughEventSeq = p.RespondsThroughEventSeq
 	}
 	stored, err := a.Store.ProposeAction(ctx, action, event(action.OrgID, action.RunID,
 		agentkit.EventActionProposed, "action_proposed:"+in.Call.ID,
-		map[string]any{"action_id": action.ID, "tool": action.Tool}))
+		map[string]any{"action_id": action.ID, "tool": action.Tool, "model_turn_id": action.ModelTurnID}))
 	if err != nil {
 		return nil, err
 	}
@@ -292,6 +399,7 @@ type ExecuteActionInput struct {
 type ExecuteActionResult struct {
 	Action   *agentkit.Action `json:"action"`
 	Terminal bool             `json:"terminal"`
+	Pause    bool             `json:"pause"`
 }
 
 // ExecuteAction runs the tool with the action's effective input (the human
@@ -329,7 +437,11 @@ func (a *Activities) ExecuteAction(ctx context.Context, in ExecuteActionInput) (
 		execErr = err
 	} else {
 		// The one place a tool ever executes: inside the action pipeline.
-		execCtx := agentkit.WithRunContext(ctx, agentkit.RunContext{RunID: action.RunID, OrgID: action.OrgID, ActionID: action.ID})
+		execCtx := agentkit.WithRunContext(ctx, agentkit.RunContext{
+			RunID: action.RunID, OrgID: action.OrgID, ActionID: action.ID,
+			ModelTurnID: action.ModelTurnID, ContextRevision: action.ContextRevision,
+			EventToSeq: action.RespondsThroughEventSeq,
+		})
 		result, execErr = tool.Execute(execCtx, action.EffectiveInput())
 	}
 
@@ -355,12 +467,17 @@ func (a *Activities) executeResult(def AgentDefinition, action *agentkit.Action)
 	// reports that durable outcome in its result; the activity interprets it so
 	// workflow code stays domain-agnostic and deterministic.
 	if action.State == agentkit.ActionCompleted {
-		var result struct { CompleteRun bool `json:"complete_run"` }
-		if json.Unmarshal(action.Result, &result) == nil && result.CompleteRun { terminal = true }
+		var result struct {
+			CompleteRun bool `json:"complete_run"`
+		}
+		if json.Unmarshal(action.Result, &result) == nil && result.CompleteRun {
+			terminal = true
+		}
 	}
 	return &ExecuteActionResult{
 		Action:   action,
 		Terminal: terminal,
+		Pause:    action.State == agentkit.ActionCompleted && def.isPause(action.Tool),
 	}
 }
 

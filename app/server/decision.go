@@ -25,6 +25,7 @@ type decisionRequest struct {
 func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	actionID := r.PathValue("id")
+	requestOrgID := orgID(r)
 
 	var req decisionRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
@@ -68,7 +69,7 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	action, err := s.Agentkit.GetAction(ctx, s.DefaultOrgID, actionID)
+	action, err := s.Agentkit.GetAction(ctx, requestOrgID, actionID)
 	if err != nil {
 		if isNotFound(err) {
 			writeError(w, http.StatusNotFound, "action not found")
@@ -77,16 +78,12 @@ func (s *Server) handleDecision(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	actorProvider := s.ActorProvider
-	if actorProvider == nil {
-		actorProvider = StaticActorProvider("dispatcher:dev")
-	}
-	actor, err := actorProvider.ActorID(r)
+	actor, err := s.actor(r)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "actor unavailable")
 		return
 	}
-	action, _, err = s.Agentkit.DecideAction(ctx, akstore.DecisionCommand{ID: req.DecisionID, OrgID: s.DefaultOrgID, ActionID: actionID,
+	action, _, err = s.Agentkit.DecideAction(ctx, akstore.DecisionCommand{ID: req.DecisionID, OrgID: requestOrgID, ActionID: actionID,
 		ExpectedActionVersion: req.ExpectedActionVersion, ExpectedContextRevision: req.ExpectedContextRevision,
 		Decision: agentkit.Decision{Kind: req.Kind, DecidedBy: actor, Reason: req.Reason}, EditedInput: req.EditedInput})
 	if err != nil {

@@ -32,6 +32,14 @@ func runAndThread(ctx context.Context, store *domain.Store) (string, *domain.Con
 	return rc.RunID, conv, err
 }
 
+func validateSourceMessages(ctx context.Context, store *domain.Store, runID string, sourceIDs []string) error {
+	rc, ok := agentkit.RunContextFrom(ctx)
+	if !ok || rc.ActionID == "" || rc.RunID != runID {
+		return fmt.Errorf("intake: source provenance requires an action context")
+	}
+	return store.ValidateActionSourceMessages(ctx, rc.ActionID, runID, sourceIDs)
+}
+
 // proposeResponseTool is the reviewed customer-facing unit. Approval releases
 // one response; intake completion is applied only after the adapter confirms
 // delivery returned successfully.
@@ -54,7 +62,7 @@ func (t *proposeResponseTool) Description() string {
 	return "Propose the single reviewed customer reply and optional delivery-dependent intake completion."
 }
 func (t *proposeResponseTool) InputSchema() json.RawMessage {
-	return json.RawMessage(`{"type":"object","properties":{"message":{"type":"string","minLength":1},"responds_through_event_seq":{"type":"integer","minimum":1},"after_delivery":{"type":"object","properties":{"complete_run":{"type":"boolean"},"mark_intake_complete":{"type":"boolean"},"summary":{"type":"string"}},"required":["complete_run","mark_intake_complete","summary"],"additionalProperties":false}},"required":["message","responds_through_event_seq","after_delivery"],"additionalProperties":false}`)
+	return json.RawMessage(`{"type":"object","properties":{"message":{"type":"string","minLength":1},"responds_through_event_seq":{"type":"integer","minimum":1,"description":"Deprecated compatibility field; omit it because Dispatch stamps the model-turn cursor."},"after_delivery":{"type":"object","properties":{"complete_run":{"type":"boolean"},"mark_intake_complete":{"type":"boolean"},"summary":{"type":"string"}},"required":["complete_run","mark_intake_complete","summary"],"additionalProperties":false}},"required":["message","after_delivery"],"additionalProperties":false}`)
 }
 func (t *proposeResponseTool) Execute(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
 	var in proposeResponseInput
@@ -69,13 +77,16 @@ func (t *proposeResponseTool) Execute(ctx context.Context, raw json.RawMessage) 
 	if err != nil {
 		return nil, err
 	}
-	if conv.EventSeq != in.RespondsThroughEventSeq {
+	expectedEventSeq := rc.EventToSeq
+	if expectedEventSeq == 0 {
+		expectedEventSeq = in.RespondsThroughEventSeq
+	}
+	if conv.EventSeq != expectedEventSeq {
 		return nil, fmt.Errorf("propose_response: stale context: conversation is at event %d", conv.EventSeq)
 	}
 	if err := t.sender.Send(ctx, conv.OrgID, conv.ID, channel.OutboundMessage{Body: in.Message, Author: domain.AuthorAgent, ID: rc.ActionID}); err != nil {
 		return nil, err
 	}
-	if err := t.store.TransitionRunToInquiry(ctx, rc.RunID); err != nil { return nil, err }
 	if in.AfterDelivery.MarkIntakeComplete {
 		if _, err := t.store.CompleteCaseForRun(ctx, rc.RunID); err != nil {
 			return nil, err
@@ -104,6 +115,46 @@ func (t *pauseTool) InputSchema() json.RawMessage {
 }
 func (t *pauseTool) Execute(_ context.Context, raw json.RawMessage) (json.RawMessage, error) {
 	return raw, nil
+}
+
+// routeIntentTool makes the triage decision durable before the agent takes a
+// lane-specific action. It is an internal control action, not a customer or
+// case mutation, but still flows through the Action pipeline.
+type routeIntentTool struct{ store *domain.Store }
+
+type routeIntentInput struct {
+	Lane             string   `json:"lane"`
+	Reason           string   `json:"reason"`
+	SourceMessageIDs []string `json:"source_message_ids"`
+}
+
+func (t *routeIntentTool) Name() string { return "route_intent" }
+func (t *routeIntentTool) Description() string {
+	return "Classify the current task as an inquiry or service job before replying or changing a case. This changes only the run's internal lane."
+}
+func (t *routeIntentTool) InputSchema() json.RawMessage {
+	return json.RawMessage(`{"type":"object","properties":{"lane":{"type":"string","enum":["inquiry","service_job"]},"reason":{"type":"string","minLength":1},"source_message_ids":{"type":"array","items":{"type":"string"},"minItems":1}},"required":["lane","reason","source_message_ids"],"additionalProperties":false}`)
+}
+func (t *routeIntentTool) Execute(ctx context.Context, raw json.RawMessage) (json.RawMessage, error) {
+	var in routeIntentInput
+	if err := json.Unmarshal(raw, &in); err != nil {
+		return nil, fmt.Errorf("route_intent: %w", err)
+	}
+	if in.Reason == "" || len(in.SourceMessageIDs) == 0 {
+		return nil, fmt.Errorf("route_intent: reason and source_message_ids are required")
+	}
+	runID, _, err := runAndThread(ctx, t.store)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateSourceMessages(ctx, t.store, runID, in.SourceMessageIDs); err != nil {
+		return nil, fmt.Errorf("route_intent: %w", err)
+	}
+	rc, _ := agentkit.RunContextFrom(ctx)
+	if err := t.store.RouteRunToLane(ctx, runID, in.Lane, in.Reason, in.SourceMessageIDs, rc.ActionID, rc.ContextRevision); err != nil {
+		return nil, fmt.Errorf("route_intent: %w", err)
+	}
+	return json.Marshal(map[string]string{"stage": in.Lane})
 }
 
 // --- update_case ---
@@ -157,7 +208,11 @@ func (t *updateCaseTool) Execute(ctx context.Context, input json.RawMessage) (js
 	if in.CaseID == "" || in.ExpectedVersion < 1 || len(in.SourceMessageIDs) == 0 {
 		return nil, fmt.Errorf("update_case: explicit case_id, expected_version, and source_message_ids are required")
 	}
-	c, err := t.store.UpdateCase(ctx, runID, in.CaseID, in.ExpectedVersion, in.Patch, in.SourceMessageIDs)
+	if err := validateSourceMessages(ctx, t.store, runID, in.SourceMessageIDs); err != nil {
+		return nil, fmt.Errorf("update_case: %w", err)
+	}
+	rc, _ := agentkit.RunContextFrom(ctx)
+	c, err := t.store.UpdateCase(ctx, runID, in.CaseID, in.ExpectedVersion, in.Patch, in.SourceMessageIDs, rc.ActionID, rc.ContextRevision)
 	if err != nil {
 		return nil, fmt.Errorf("update_case: %w", err)
 	}
@@ -209,7 +264,11 @@ func (t *selectCaseTool) Execute(ctx context.Context, raw json.RawMessage) (json
 	if err != nil {
 		return nil, err
 	}
-	c, err := t.store.SelectCaseForRun(ctx, runID, in.CaseID, in.Reason, in.SourceMessageIDs)
+	if err := validateSourceMessages(ctx, t.store, runID, in.SourceMessageIDs); err != nil {
+		return nil, fmt.Errorf("select_case: %w", err)
+	}
+	rc, _ := agentkit.RunContextFrom(ctx)
+	c, err := t.store.SelectCaseForRun(ctx, runID, in.CaseID, in.Reason, in.SourceMessageIDs, rc.ActionID, rc.ContextRevision)
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +297,11 @@ func (t *createCaseTool) Execute(ctx context.Context, raw json.RawMessage) (json
 	if err != nil {
 		return nil, err
 	}
-	c, err := t.store.CreateCaseForRun(ctx, runID, in.InitialFields, in.SourceMessageIDs)
+	if err := validateSourceMessages(ctx, t.store, runID, in.SourceMessageIDs); err != nil {
+		return nil, fmt.Errorf("create_case: %w", err)
+	}
+	rc, _ := agentkit.RunContextFrom(ctx)
+	c, err := t.store.CreateCaseForRun(ctx, runID, in.InitialFields, in.SourceMessageIDs, rc.ActionID, rc.ContextRevision)
 	if err != nil {
 		return nil, err
 	}

@@ -26,6 +26,8 @@ const AgentLoopWorkflowName = "AgentLoop"
 // AgentDefinition when an agent needs a different ceiling.
 const MaxLLMCallsPerTurn = 8
 
+const agentBehaviorRuntimeChange = "agent-behavior-runtime-v1"
+
 // Register wires the agent loop workflow and its activities into a worker.
 func Register(w worker.Worker, acts *Activities) {
 	w.RegisterWorkflowWithOptions(AgentLoopWorkflow, workflow.RegisterOptions{Name: AgentLoopWorkflowName})
@@ -44,6 +46,8 @@ func Register(w worker.Worker, acts *Activities) {
 // Workflow code only orchestrates; every side effect is an activity.
 func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 	logger := workflow.GetLogger(ctx)
+	runtimeVersion := workflow.GetVersion(ctx, agentBehaviorRuntimeChange, workflow.DefaultVersion, 1)
+	useRuntimeSnapshots := runtimeVersion >= 1
 
 	llmCtx := workflow.WithActivityOptions(ctx, workflow.ActivityOptions{
 		StartToCloseTimeout: 5 * time.Minute, // LLM turns can run long
@@ -66,13 +70,13 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 		// the agent runs a turn only when the *customer* spoke — a dispatcher
 		// message informs the agent without provoking it to talk over a human
 		// who is handling the conversation (design/003-dispatcher-as-participant.md).
-		sawCustomer, dropped := awaitContext(ctx, inboundCh, dispatcherCh, decisionCh, log)
+		sawCustomer, dropped := awaitContext(ctx, inboundCh, dispatcherCh, decisionCh, log, useRuntimeSnapshots)
 		for _, d := range dropped {
 			recordDroppedDecision(actCtx, input, d,
 				"no action was awaiting a decision", logger)
 		}
 		if sawCustomer {
-			terminal, err := agentTurn(llmCtx, actCtx, inboundCh, decisionCh, dispatcherCh, input, log, &llmCalls)
+			terminal, err := agentTurn(llmCtx, actCtx, inboundCh, decisionCh, dispatcherCh, input, log, &llmCalls, useRuntimeSnapshots)
 			if err != nil {
 				finishRun(actCtx, input, agentkit.RunFailed, logger)
 				return err
@@ -90,6 +94,9 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 			next := input
 			next.TranscriptLen = log.transcriptLen
 			next.PendingMessages = log.pending
+			if useRuntimeSnapshots {
+				next.PendingMessageIDs = log.pendingMessageIDs
+			}
 			next.ProcessedMessageIDs = log.seenIDs
 			next.LLMCalls = llmCalls
 			return workflow.NewContinueAsNewError(ctx, AgentLoopWorkflowName, next)
@@ -105,18 +112,20 @@ func AgentLoopWorkflow(ctx workflow.Context, input AgentLoopInput) error {
 // ID, and each external message informs the agent exactly once. The message
 // content itself stays out of workflow history (OVERVIEW §6.1 #3).
 type messageLog struct {
-	transcriptLen int             // persisted rows; BaseSeq for the next completion
-	pending       []llm.Message   // context awaiting the next completion's flush
-	seenIDs       []string        // append-ordered, deterministic under replay
-	seen          map[string]bool // same contents, for lookup
+	transcriptLen     int             // persisted rows; BaseSeq for the next completion
+	pending           []llm.Message   // context awaiting the next completion's flush
+	pendingMessageIDs []string        // external messages represented by pending
+	seenIDs           []string        // append-ordered, deterministic under replay
+	seen              map[string]bool // same contents, for lookup
 }
 
 func newMessageLog(input AgentLoopInput) *messageLog {
 	l := &messageLog{
-		transcriptLen: input.TranscriptLen,
-		pending:       input.PendingMessages,
-		seenIDs:       input.ProcessedMessageIDs,
-		seen:          make(map[string]bool, len(input.ProcessedMessageIDs)),
+		transcriptLen:     input.TranscriptLen,
+		pending:           input.PendingMessages,
+		pendingMessageIDs: input.PendingMessageIDs,
+		seenIDs:           input.ProcessedMessageIDs,
+		seen:              make(map[string]bool, len(input.ProcessedMessageIDs)),
 	}
 	for _, id := range input.ProcessedMessageIDs {
 		l.seen[id] = true
@@ -149,16 +158,24 @@ func (l *messageLog) mark(id string) bool {
 // by definition. They are returned to the caller to be recorded as
 // decision_dropped events (OVERVIEW §6.1 #4) rather than sitting in the
 // channel forever (which would also block ContinueAsNew).
-func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh, decisionCh workflow.ReceiveChannel, log *messageLog) (sawCustomer bool, dropped []DecisionSignal) {
+func awaitContext(ctx workflow.Context, inboundCh, dispatcherCh, decisionCh workflow.ReceiveChannel, log *messageLog, useRuntimeSnapshots bool) (sawCustomer bool, dropped []DecisionSignal) {
 	absorbInbound := func(m InboundMessage) {
 		if log.mark(m.MessageID) {
-			log.pending = append(log.pending, llm.UserText(ExternalText(m.Text)))
+			text := ExternalText(m.Text)
+			if useRuntimeSnapshots {
+				text = ExternalTextWithID(m.MessageID, m.Text)
+				log.pendingMessageIDs = append(log.pendingMessageIDs, m.MessageID)
+			}
+			log.pending = append(log.pending, llm.UserText(text))
 			sawCustomer = true
 		}
 	}
 	absorbDispatcher := func(m DispatcherMessageSignal) {
 		if log.mark(m.MessageID) {
 			log.pending = append(log.pending, DispatcherContextMessage(m.Text))
+			if useRuntimeSnapshots {
+				log.pendingMessageIDs = append(log.pendingMessageIDs, m.MessageID)
+			}
 		}
 	}
 	sel := workflow.NewSelector(ctx)
@@ -230,7 +247,7 @@ func finishRun(actCtx workflow.Context, input AgentLoopInput, status agentkit.Ru
 
 // agentTurn runs LLM completions until the agent stops proposing tool calls,
 // a terminal tool executes successfully, or the turn's LLM budget runs out.
-func agentTurn(llmCtx, actCtx workflow.Context, inboundCh, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog, llmCalls *int) (terminal bool, err error) {
+func agentTurn(llmCtx, actCtx workflow.Context, inboundCh, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog, llmCalls *int, useRuntimeSnapshots bool) (terminal bool, err error) {
 	logger := workflow.GetLogger(llmCtx)
 
 	turnCalls := 0
@@ -255,7 +272,7 @@ func agentTurn(llmCtx, actCtx workflow.Context, inboundCh, decisionCh, dispatche
 		*llmCalls++
 
 		var result CompleteResult
-		err := workflow.ExecuteActivity(llmCtx, "Complete", CompleteInput{
+		completeInput := CompleteInput{
 			RunID:         input.RunID,
 			OrgID:         input.OrgID,
 			Agent:         input.Agent,
@@ -263,7 +280,11 @@ func agentTurn(llmCtx, actCtx workflow.Context, inboundCh, decisionCh, dispatche
 			BaseSeq:       log.transcriptLen,
 			Delta:         log.pending,
 			SystemContext: input.SystemContext,
-		}).Get(llmCtx, &result)
+		}
+		if useRuntimeSnapshots {
+			completeInput.TriggeringMessageIDs = log.pendingMessageIDs
+		}
+		err := workflow.ExecuteActivity(llmCtx, "Complete", completeInput).Get(llmCtx, &result)
 		if err != nil {
 			return false, fmt.Errorf("llm completion: %w", err)
 		}
@@ -271,6 +292,7 @@ func agentTurn(llmCtx, actCtx workflow.Context, inboundCh, decisionCh, dispatche
 		// transcript; the workflow keeps only the new length.
 		log.transcriptLen = result.TranscriptLen
 		log.pending = nil
+		log.pendingMessageIDs = nil
 		resp := *result.Response
 		if len(resp.Content) == 0 {
 			logger.Warn("empty completion", "stop_reason", resp.StopReason)
@@ -299,14 +321,18 @@ func agentTurn(llmCtx, actCtx workflow.Context, inboundCh, decisionCh, dispatche
 		var results []llm.ToolResult
 		var notes []string // dispatcher messages that arrived mid-turn
 		standDown := false // a draft was dismissed or superseded: end the turn
+		pause := false     // a pause tool waits for new external context
 		for _, call := range calls {
-			outcome, note, err := decideAndExecute(actCtx, inboundCh, decisionCh, dispatcherCh, input, log, call)
+			outcome, note, err := decideAndExecute(actCtx, inboundCh, decisionCh, dispatcherCh, input, log, call, result, useRuntimeSnapshots)
 			if err != nil {
 				return false, err
 			}
 			results = append(results, feedback(outcome.Action, call))
 			if outcome.Terminal {
 				terminal = true
+			}
+			if useRuntimeSnapshots && outcome.Pause {
+				pause = true
 			}
 			if isStandDown(outcome.Action) {
 				standDown = true
@@ -328,6 +354,9 @@ func agentTurn(llmCtx, actCtx workflow.Context, inboundCh, decisionCh, dispatche
 			// directly. The agent does not re-draft now; it waits for the
 			// customer's next message, which re-engages it with full context
 			// (the dismissal/dispatcher reply is already in context above).
+			return false, nil
+		}
+		if pause {
 			return false, nil
 		}
 		// Loop: the agent sees decisions/results and may revise (e.g. after
@@ -360,16 +389,23 @@ func toolResultsWithNotes(results []llm.ToolResult, notes []string) llm.Message 
 // proposed action waits for a human decision, a dispatcher message may arrive
 // instead — the human answered the customer directly — which supersedes the
 // pending action and returns the dispatcher's text as a context note.
-func decideAndExecute(actCtx workflow.Context, inboundCh, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog, call llm.ToolCall) (*ExecuteActionResult, string, error) {
+func decideAndExecute(actCtx workflow.Context, inboundCh, decisionCh, dispatcherCh workflow.ReceiveChannel, input AgentLoopInput, log *messageLog, call llm.ToolCall, turn CompleteResult, useRuntimeSnapshots bool) (*ExecuteActionResult, string, error) {
 	logger := workflow.GetLogger(actCtx)
 
 	var action agentkit.Action
-	err := workflow.ExecuteActivity(actCtx, "ProposeAction", ProposeActionInput{
+	proposal := ProposeActionInput{
 		RunID: input.RunID,
 		OrgID: input.OrgID,
 		Agent: input.Agent,
 		Call:  call,
-	}).Get(actCtx, &action)
+	}
+	if useRuntimeSnapshots {
+		proposal.ModelTurnID = turn.ModelTurnID
+		proposal.ContextRevision = turn.ContextRevision
+		proposal.EventToSeq = turn.EventToSeq
+		proposal.DependencyVersions = turn.DependencyVersions
+	}
+	err := workflow.ExecuteActivity(actCtx, "ProposeAction", proposal).Get(actCtx, &action)
 	if err != nil {
 		return nil, "", fmt.Errorf("propose action: %w", err)
 	}
@@ -401,7 +437,12 @@ func decideAndExecute(actCtx workflow.Context, inboundCh, decisionCh, dispatcher
 			if !log.mark(inbound.MessageID) {
 				continue
 			}
-			log.pending = append(log.pending, llm.UserText(ExternalText(inbound.Text)))
+			text := ExternalText(inbound.Text)
+			if useRuntimeSnapshots {
+				text = ExternalTextWithID(inbound.MessageID, inbound.Text)
+				log.pendingMessageIDs = append(log.pendingMessageIDs, inbound.MessageID)
+			}
+			log.pending = append(log.pending, llm.UserText(text))
 			err := workflow.ExecuteActivity(actCtx, "RecordDecision", RecordDecisionInput{OrgID: input.OrgID, RunID: input.RunID, Decision: DecisionSignal{ActionID: action.ID, Kind: agentkit.DecisionSupersede, DecidedBy: "system:inbound", Reason: "new customer message"}}).Get(actCtx, &action)
 			if err != nil {
 				return nil, "", fmt.Errorf("record inbound supersession: %w", err)
@@ -539,8 +580,21 @@ const ExternalMessageTag = "external_message"
 // convention an adapter could forget. Any embedded closing tag is defanged so
 // the text cannot break out of the fence.
 func ExternalText(text string) string {
+	return ExternalTextWithID("", text)
+}
+
+// ExternalTextWithID fences customer-authored text and exposes the persisted
+// message ID as trusted metadata outside the text body. Tools that require
+// provenance can therefore cite a real ID instead of asking the model to
+// invent one. Message IDs are generated by the application, not the customer.
+func ExternalTextWithID(messageID, text string) string {
 	escaped := strings.ReplaceAll(text, "</"+ExternalMessageTag, "<\\/"+ExternalMessageTag)
-	return "<" + ExternalMessageTag + ">\n" + escaped + "\n</" + ExternalMessageTag + ">"
+	open := "<" + ExternalMessageTag
+	if messageID != "" {
+		messageID = strings.NewReplacer("&", "&amp;", `"`, "&quot;", "<", "&lt;", ">", "&gt;").Replace(messageID)
+		open += ` message_id="` + messageID + `"`
+	}
+	return open + ">\n" + escaped + "\n</" + ExternalMessageTag + ">"
 }
 
 // DispatcherContextMessage wraps a dispatcher's direct message as a
