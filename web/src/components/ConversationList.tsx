@@ -1,19 +1,21 @@
 import { useQuery } from '@tanstack/react-query'
-import { Link } from '@tanstack/react-router'
+import { Link, useNavigate, useRouterState } from '@tanstack/react-router'
 import { PlusIcon, TriangleAlertIcon } from 'lucide-react'
 import { listConversations } from '../api'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { waitingFor } from '@/lib/format'
 import { cn } from '@/lib/utils'
+import { ToggleGroup, ToggleGroupItem } from '@/components/ui/toggle-group'
 
 export function ConversationList() {
+	const navigate=useNavigate();const filter=useRouterState({select:s=>new URLSearchParams(s.location.searchStr).get('filter')??'all'})
   const { data } = useQuery({
     queryKey: ['conversations'],
     queryFn: listConversations,
     refetchInterval: 3000,
   })
-  const conversations = data?.conversations ?? []
+  const conversations = (data?.conversations ?? []).filter(c=>filter==='needs_decision'?c.pending_count>0:filter==='escalated'?c.conversation.attention_state==='flagged':true).sort((a,b)=>{const ae=a.conversation.attention_state==='flagged',be=b.conversation.attention_state==='flagged';if(ae!==be)return ae?-1:1;return (a.oldest_pending_at??'z').localeCompare(b.oldest_pending_at??'z')})
 
   return (
     <div>
@@ -21,13 +23,14 @@ export function ConversationList() {
         <span className="font-mono text-[11px] font-medium tracking-widest text-muted-foreground uppercase">
           Conversations
         </span>
-        <Link to="/">
+        <Link to="/inbox">
           <Button variant="outline" size="xs">
             <PlusIcon data-icon="inline-start" />
             New
           </Button>
         </Link>
       </div>
+      <div className="px-3 pb-2"><ToggleGroup value={[filter]} onValueChange={v=>v[0]&&navigate({to:'/inbox',search:{filter:v[0] as 'all'|'needs_decision'|'escalated'}})} variant="outline" size="sm" spacing={0} className="w-full"><ToggleGroupItem value="needs_decision">Needs decision</ToggleGroupItem><ToggleGroupItem value="escalated">Escalated</ToggleGroupItem><ToggleGroupItem value="all">All</ToggleGroupItem></ToggleGroup></div>
       {conversations.length === 0 && (
         <p className="px-4 py-3 text-sm text-muted-foreground">
           No conversations yet. Start one as a customer.
@@ -39,7 +42,7 @@ export function ConversationList() {
           return (
             <li key={c.conversation.id}>
               <Link
-                to="/conversations/$conversationId"
+                to="/inbox/$conversationId"
                 params={{ conversationId: c.conversation.id }}
                 className={cn(
                   'block border-b px-4 py-3 hover:bg-muted/60',

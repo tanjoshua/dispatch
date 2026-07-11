@@ -27,8 +27,6 @@ func env(key, fallback string) string {
 func main() {
 	databaseURL := env("DATABASE_URL", "postgres://dispatch:dispatch@localhost:5432/dispatch?sslmode=disable")
 	temporalAddr := env("TEMPORAL_ADDRESS", "localhost:7233")
-	model := env("DISPATCH_MODEL", anthropic.DefaultModel)
-
 	var llmClient llm.LLM = anthropic.New()
 	if os.Getenv("DISPATCH_FAKE_LLM") != "" {
 		llmClient = intake.ScriptedLLM{}
@@ -57,8 +55,8 @@ func main() {
 		log.Println("warning: DISPATCH_ESCALATION_WEBHOOK_URL is not set; escalations only flag the UI queue (the escalate tool description reflects this)")
 	}
 
-	w := appworker.New(tc, pool, model, llmClient, notifier)
-	log.Printf("worker starting (model=%s, temporal=%s)", model, temporalAddr)
+	w := appworker.New(tc, pool, llmClient, notifier)
+	log.Printf("worker starting (model resolved per playbook, temporal=%s)", temporalAddr)
 	if err := w.Run(worker.InterruptCh()); err != nil {
 		log.Fatalf("worker: %v", err)
 	}

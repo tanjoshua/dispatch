@@ -15,25 +15,25 @@ import (
 	"dispatch/agentkit/temporalkit"
 	"dispatch/app"
 	"dispatch/app/agents/intake"
+	agentresolve "dispatch/app/agents/resolve"
 	"dispatch/app/channel"
 	"dispatch/app/channel/dev"
 	"dispatch/app/domain"
 	"dispatch/app/notify"
+	"dispatch/app/packs"
 )
 
 // New builds the dispatch worker on the shared task queue. notifier may be
 // nil — escalations then only flag the UI queue.
-func New(tc temporalclient.Client, pool *pgxpool.Pool, model string, llmClient llm.LLM, notifier notify.Notifier) worker.Worker {
+func New(tc temporalclient.Client, pool *pgxpool.Pool, llmClient llm.LLM, notifier notify.Notifier) worker.Worker {
 	appStore := domain.NewStore(pool)
 	sender := channel.NewSender(appStore, channel.NewRegistry(dev.New(appStore)))
-	def := intake.Definition(model, appStore, sender, notifier)
+	resolver := agentresolve.New(appStore, packs.Default(), intake.Tools(appStore, sender, notifier))
 
 	acts := &temporalkit.Activities{
-		LLM:   llmClient,
-		Store: store.NewPostgres(pool),
-		Agents: map[string]temporalkit.AgentDefinition{
-			def.Name: def,
-		},
+		LLM:           llmClient,
+		Store:         store.NewPostgres(pool),
+		Agents:        resolver,
 		ActionContext: appStore.ActionContext,
 		// A tripped turn budget means the agent was acting without a human in
 		// the path; flag the conversation so a dispatcher engages (the same

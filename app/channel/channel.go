@@ -89,6 +89,20 @@ type Adapter interface {
 // Registry maps channel kinds to their adapters.
 type Registry map[string]Adapter
 
+type KindInfo struct {
+	ID          string `json:"id"`
+	Label       string `json:"label"`
+	Status      string `json:"status"`
+	Description string `json:"description"`
+}
+
+func Kinds() []KindInfo {
+	return []KindInfo{
+		{ID: "dev", Label: "Dev simulator", Status: "available", Description: "A local test connection for simulated conversations."},
+		{ID: "whatsapp", Label: "WhatsApp", Status: "coming_soon", Description: "Connect a WhatsApp Business number."},
+	}
+}
+
 func NewRegistry(adapters ...Adapter) Registry {
 	r := make(Registry, len(adapters))
 	for _, a := range adapters {

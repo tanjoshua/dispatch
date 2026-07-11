@@ -77,6 +77,9 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 	reply := func(text string) llm.ContentBlock {
 		return call(0, "propose_response", map[string]any{"message": text, "responds_through_event_seq": userTurns, "after_delivery": map[string]any{"complete_run": false, "mark_intake_complete": false, "summary": ""}})
 	}
+	inquiryReply := func(text string) llm.ContentBlock {
+		return call(0, "propose_response", map[string]any{"message": text, "responds_through_event_seq": userTurns, "after_delivery": map[string]any{"complete_run": true, "mark_intake_complete": false, "summary": ""}})
+	}
 
 	var content []llm.ContentBlock
 	switch {
@@ -92,6 +95,10 @@ func (ScriptedLLM) Complete(_ context.Context, req llm.CompletionRequest) (*llm.
 				"category": "emergency",
 			}),
 		}
+	// The deterministic demo cannot read organization config. This branch is
+	// intentionally representative only; grounding is verified with a real LLM.
+	case strings.Contains(strings.ToLower(lastText), "hours") || strings.Contains(strings.ToLower(lastText), "open"):
+		content = []llm.ContentBlock{inquiryReply("We're open Monday–Friday, 8am–6pm, and Saturday, 9am–1pm. We're closed Sunday.")}
 	case userTurns <= 1:
 		content = []llm.ContentBlock{reply("Thanks for reaching out! Could I get your name and the service address?")}
 	case userTurns == 2:

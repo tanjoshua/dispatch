@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"dispatch/agentkit"
 	"dispatch/agentkit/llm"
@@ -16,7 +17,7 @@ import (
 type Activities struct {
 	LLM    llm.LLM
 	Store  store.Store
-	Agents map[string]AgentDefinition
+	Agents AgentResolver
 
 	// TurnBudgetExceeded, when non-nil, is invoked after a turn_budget_exceeded
 	// event is recorded, so the application can summon a human (flag the
@@ -28,12 +29,11 @@ type Activities struct {
 	ActionContext func(ctx context.Context, runID string) (revision int64, dependencies json.RawMessage, err error)
 }
 
-func (a *Activities) agent(name string) (AgentDefinition, error) {
-	def, ok := a.Agents[name]
-	if !ok {
-		return AgentDefinition{}, fmt.Errorf("temporalkit: unknown agent %q", name)
+func (a *Activities) agent(ctx context.Context, orgID, runID, name string) (AgentDefinition, error) {
+	if a.Agents == nil {
+		return AgentDefinition{}, fmt.Errorf("temporalkit: no agent resolver configured")
 	}
-	return def, nil
+	return a.Agents.Resolve(ctx, orgID, runID, name)
 }
 
 // CompleteInput asks the LLM for the agent's next turn. Seq is the 1-based
@@ -68,7 +68,7 @@ type CompleteResult struct {
 }
 
 func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*CompleteResult, error) {
-	def, err := a.agent(in.Agent)
+	def, err := a.agent(ctx, in.OrgID, in.RunID, in.Agent)
 	if err != nil {
 		return nil, err
 	}
@@ -97,6 +97,7 @@ func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*CompleteR
 	if in.SystemContext != "" {
 		system += "\n\n" + in.SystemContext
 	}
+	started := time.Now()
 	resp, err := a.LLM.Complete(ctx, llm.CompletionRequest{
 		Model:     def.Model,
 		System:    system,
@@ -111,15 +112,15 @@ func (a *Activities) Complete(ctx context.Context, in CompleteInput) (*CompleteR
 	// substrate and cannot be backfilled. It goes in before the assistant turn:
 	// once the turn exists, retries take the stored-turn path above and would
 	// never write the event.
+	payload := map[string]any{
+		"model": def.Model, "input_tokens": resp.Usage.InputTokens,
+		"output_tokens": resp.Usage.OutputTokens, "stop_reason": resp.StopReason,
+		"seq": in.Seq, "duration_ms": time.Since(started).Milliseconds(),
+	}
+	for key, value := range def.Tags { payload[key] = value }
 	if err := a.Store.AppendEvent(ctx, event(in.OrgID, in.RunID,
 		agentkit.EventLLMCompleted, fmt.Sprintf("llm_completed:%d", in.Seq),
-		map[string]any{
-			"model":         def.Model,
-			"input_tokens":  resp.Usage.InputTokens,
-			"output_tokens": resp.Usage.OutputTokens,
-			"stop_reason":   resp.StopReason,
-			"seq":           in.Seq,
-		})); err != nil {
+		payload)); err != nil {
 		return nil, err
 	}
 	// An empty reply is not recorded (an empty assistant turn would poison
@@ -200,7 +201,7 @@ type ProposeActionInput struct {
 // decisions immediately; everything else lands in pending_approval for a
 // human. Returns the action in its post-policy state.
 func (a *Activities) ProposeAction(ctx context.Context, in ProposeActionInput) (*agentkit.Action, error) {
-	def, err := a.agent(in.Agent)
+	def, err := a.agent(ctx, in.OrgID, in.RunID, in.Agent)
 	if err != nil {
 		return nil, err
 	}
@@ -298,11 +299,11 @@ type ExecuteActionResult struct {
 // the action already finished — e.g. the activity is being retried — the
 // stored outcome is returned without re-executing.
 func (a *Activities) ExecuteAction(ctx context.Context, in ExecuteActionInput) (*ExecuteActionResult, error) {
-	def, err := a.agent(in.Agent)
+	action, err := a.Store.GetAction(ctx, in.OrgID, in.ActionID)
 	if err != nil {
 		return nil, err
 	}
-	action, err := a.Store.GetAction(ctx, in.OrgID, in.ActionID)
+	def, err := a.agent(ctx, action.OrgID, action.RunID, in.Agent)
 	if err != nil {
 		return nil, err
 	}
@@ -348,9 +349,18 @@ func (a *Activities) ExecuteAction(ctx context.Context, in ExecuteActionInput) (
 }
 
 func (a *Activities) executeResult(def AgentDefinition, action *agentkit.Action) *ExecuteActionResult {
+	terminal := action.State == agentkit.ActionCompleted && def.isTerminal(action.Tool)
+	// Some output tools can finish only selected invocations (for example an
+	// inquiry response, while an intake question keeps the run open). The tool
+	// reports that durable outcome in its result; the activity interprets it so
+	// workflow code stays domain-agnostic and deterministic.
+	if action.State == agentkit.ActionCompleted {
+		var result struct { CompleteRun bool `json:"complete_run"` }
+		if json.Unmarshal(action.Result, &result) == nil && result.CompleteRun { terminal = true }
+	}
 	return &ExecuteActionResult{
 		Action:   action,
-		Terminal: action.State == agentkit.ActionCompleted && def.isTerminal(action.Tool),
+		Terminal: terminal,
 	}
 }
 

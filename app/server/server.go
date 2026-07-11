@@ -17,6 +17,7 @@ import (
 	akstore "dispatch/agentkit/store"
 	"dispatch/app/channel"
 	"dispatch/app/domain"
+	"dispatch/app/packs"
 )
 
 type Server struct {
@@ -33,6 +34,7 @@ type Server struct {
 	// resolves org from the channel connection (design/002).
 	DefaultOrgID  string
 	ActorProvider ActorProvider
+	Packs         packs.Registry
 }
 
 // ActorProvider is the authentication seam for audit attribution. Development
@@ -62,6 +64,15 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/conversations/{id}/acknowledge", s.handleAcknowledge)
 	mux.HandleFunc("GET /api/runs/{id}/events", s.handleRunEvents)
 	mux.HandleFunc("GET /api/stats/decisions", s.handleDecisionStats)
+	mux.HandleFunc("GET /api/packs", s.handlePacks)
+	mux.HandleFunc("GET /api/playbooks", s.handleListPlaybooks)
+	mux.HandleFunc("GET /api/playbooks/{id}", s.handleGetPlaybook)
+	mux.HandleFunc("PATCH /api/playbooks/{id}", s.handleUpdatePlaybook)
+	mux.HandleFunc("GET /api/org/profile", s.handleGetOrgProfile)
+	mux.HandleFunc("PATCH /api/org/profile", s.handleUpdateOrgProfile)
+	mux.HandleFunc("GET /api/channels", s.handleListChannels)
+	mux.HandleFunc("POST /api/channels", s.handleCreateChannel)
+	mux.HandleFunc("PATCH /api/channels/{id}", s.handleUpdateChannel)
 	return cors(mux)
 }
 
@@ -89,7 +100,7 @@ func cors(next http.Handler) http.Handler {
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Access-Control-Allow-Origin", "*")
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PATCH, OPTIONS")
 		w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
 		if r.Method == http.MethodOptions {
 			w.WriteHeader(http.StatusNoContent)
@@ -180,6 +191,8 @@ type conversationDetail struct {
 	CurrentDraft    *agentkit.Action        `json:"current_draft,omitempty"`
 	Run             *agentkit.Run           `json:"run,omitempty"`
 	Actions         []agentkit.Action       `json:"actions"`
+	CurrentStage    string                  `json:"current_stage,omitempty"`
+	LastModel       string                  `json:"last_model,omitempty"`
 }
 
 func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
@@ -206,6 +219,10 @@ func (s *Server) handleGetConversation(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if runID, err := s.Domain.LatestRunIDForConversation(ctx, conv.ID); err == nil && runID != "" {
+		detail.CurrentStage, _ = s.Domain.StageForRun(ctx, runID)
+		if events, err := s.Agentkit.ListEventsByRun(ctx, s.DefaultOrgID, runID); err == nil {
+			for i := len(events)-1; i >= 0; i-- { if events[i].Type == agentkit.EventLLMCompleted { var usage struct{Model string `json:"model"`}; if json.Unmarshal(events[i].Payload,&usage)==nil { detail.LastModel=usage.Model }; break } }
+		}
 		if c, err := s.Domain.SelectedCaseForRun(ctx, runID); err == nil {
 			detail.Case = c
 		}

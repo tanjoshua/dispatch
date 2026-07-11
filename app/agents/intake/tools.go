@@ -75,6 +75,7 @@ func (t *proposeResponseTool) Execute(ctx context.Context, raw json.RawMessage) 
 	if err := t.sender.Send(ctx, conv.OrgID, conv.ID, channel.OutboundMessage{Body: in.Message, Author: domain.AuthorAgent, ID: rc.ActionID}); err != nil {
 		return nil, err
 	}
+	if err := t.store.TransitionRunToInquiry(ctx, rc.RunID); err != nil { return nil, err }
 	if in.AfterDelivery.MarkIntakeComplete {
 		if _, err := t.store.CompleteCaseForRun(ctx, rc.RunID); err != nil {
 			return nil, err

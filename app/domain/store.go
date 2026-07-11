@@ -157,12 +157,12 @@ func (s *Store) ContactAddressForConversation(ctx context.Context, conversationI
 // --- channel connections ---
 
 const channelConnectionSelect = `
-	SELECT id, org_id, kind, address, config, status, COALESCE(default_playbook_id, ''), created_at
+	SELECT id, org_id, kind, address, config, status, COALESCE(default_playbook_id, ''), version, created_at
 	FROM channel_connections`
 
 func (s *Store) scanChannelConnection(row pgx.Row) (*ChannelConnection, error) {
 	var c ChannelConnection
-	err := row.Scan(&c.ID, &c.OrgID, &c.Kind, &c.Address, &c.Config, &c.Status, &c.DefaultPlaybookID, &c.CreatedAt)
+	err := row.Scan(&c.ID, &c.OrgID, &c.Kind, &c.Address, &c.Config, &c.Status, &c.DefaultPlaybookID, &c.Version, &c.CreatedAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -355,8 +355,8 @@ func (s *Store) ClaimRunBinding(ctx context.Context, orgID, conversationID, cand
 		pb = &playbookID
 	}
 	if _, err := tx.Exec(ctx, `
-		INSERT INTO run_bindings (run_id, org_id, conversation_id, task_kind, playbook_id)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO run_bindings (run_id, org_id, conversation_id, task_kind, playbook_id, stage)
+		VALUES ($1, $2, $3, $4, $5, 'triage')
 		ON CONFLICT (run_id) DO NOTHING`,
 		candidateRunID, orgID, conversationID, taskKind, pb); err != nil {
 		return "", err
@@ -379,6 +379,28 @@ func (s *Store) LatestRunIDForConversation(ctx context.Context, conversationID s
 		return "", err
 	}
 	return runID, nil
+}
+
+// TransitionRunToInquiry advances a case-less run after its first inquiry
+// response is delivered. It is idempotent and never moves a run backwards.
+func (s *Store) TransitionRunToInquiry(ctx context.Context, runID string) error {
+	tx, err := s.pool.Begin(ctx); if err != nil { return err }; defer tx.Rollback(ctx)
+	var orgID, convID string
+	var changed bool
+	err = tx.QueryRow(ctx, `UPDATE run_bindings SET stage='inquiry'
+		WHERE run_id=$1 AND stage='triage' AND case_id IS NULL
+		RETURNING org_id,conversation_id,true`, runID).Scan(&orgID,&convID,&changed)
+	if errors.Is(err, pgx.ErrNoRows) { return tx.Commit(ctx) }
+	if err != nil { return err }
+	if changed { if err := appendConversationEvent(ctx,tx,orgID,convID,runID,"","run_stage_changed",nil,map[string]any{"from":"triage","to":"inquiry"}); err != nil { return err } }
+	return tx.Commit(ctx)
+}
+
+func (s *Store) StageForRun(ctx context.Context, runID string) (string, error) {
+	var stage string
+	err := s.pool.QueryRow(ctx, `SELECT stage FROM run_bindings WHERE run_id=$1`, runID).Scan(&stage)
+	if errors.Is(err, pgx.ErrNoRows) { return "", ErrNotFound }
+	return stage, err
 }
 
 // RaiseEscalation projects an escalate action onto the conversation: it flags
@@ -816,9 +838,10 @@ func (s *Store) SelectCaseForRun(ctx context.Context, runID, caseID, reason stri
 		return nil, fmt.Errorf("domain: case does not belong to resolved customer")
 	}
 	if bound == nil {
-		if _, err := tx.Exec(ctx, `UPDATE run_bindings SET case_id=$2 WHERE run_id=$1`, runID, caseID); err != nil {
+		if _, err := tx.Exec(ctx, `UPDATE run_bindings SET case_id=$2,stage='service_job' WHERE run_id=$1`, runID, caseID); err != nil {
 			return nil, err
 		}
+		if err := appendConversationEvent(ctx, tx, orgID, convID, runID, caseID, "run_stage_changed", sourceMessageIDs, map[string]any{"to":"service_job"}); err != nil { return nil, err }
 	}
 	if err := appendConversationEvent(ctx, tx, orgID, convID, runID, caseID, "case_selected", sourceMessageIDs, map[string]any{"reason": reason}); err != nil {
 		return nil, err
@@ -858,9 +881,10 @@ func (s *Store) CreateCaseForRun(ctx context.Context, runID string, fields json.
 		VALUES($1,$2,$3,$4,$5,$6)`, id, orgID, convID, customerID, caseType, fields); err != nil {
 		return nil, err
 	}
-	if _, err := tx.Exec(ctx, `UPDATE run_bindings SET case_id=$2 WHERE run_id=$1`, runID, id); err != nil {
+	if _, err := tx.Exec(ctx, `UPDATE run_bindings SET case_id=$2,stage='service_job' WHERE run_id=$1`, runID, id); err != nil {
 		return nil, err
 	}
+	if err := appendConversationEvent(ctx, tx, orgID, convID, runID, id, "run_stage_changed", sourceMessageIDs, map[string]any{"to":"service_job"}); err != nil { return nil, err }
 	if err := appendConversationEvent(ctx, tx, orgID, convID, runID, id, "case_created", sourceMessageIDs, map[string]any{"initial_fields": fields}); err != nil {
 		return nil, err
 	}
@@ -967,7 +991,7 @@ func (s *Store) UpsertCaseForRun(ctx context.Context, runID, orgID, conversation
 			return nil, err
 		}
 		if _, err := tx.Exec(ctx, `
-			UPDATE run_bindings SET case_id = $2 WHERE run_id = $1`, runID, id); err != nil {
+			UPDATE run_bindings SET case_id = $2, stage='service_job' WHERE run_id = $1`, runID, id); err != nil {
 			return nil, err
 		}
 		caseID = &id
@@ -1023,7 +1047,7 @@ func (s *Store) BindRunToLatestCase(ctx context.Context, runID string) (*Case, e
 		return nil, err
 	}
 	if _, err := tx.Exec(ctx, `
-		UPDATE run_bindings SET case_id = $2 WHERE run_id = $1`, runID, caseID); err != nil {
+		UPDATE run_bindings SET case_id = $2, stage='service_job' WHERE run_id = $1`, runID, caseID); err != nil {
 		return nil, err
 	}
 	if _, err := tx.Exec(ctx, `

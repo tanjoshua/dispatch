@@ -135,6 +135,8 @@ export interface ConversationDetail {
 	candidate_cases: Case[]
 	current_draft?: Action
   run?: Run
+  current_stage?: string
+  last_model?: string
   actions: Action[] | null
 }
 
@@ -163,10 +165,42 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   })
   if (!res.ok) {
     const body = await res.json().catch(() => null)
-    throw new Error(body?.error ?? `${res.status} ${res.statusText}`)
+    throw new ApiError(body?.error ?? `${res.status} ${res.statusText}`, res.status, body)
   }
   return res.json()
 }
+
+export class ApiError extends Error {
+  status: number
+  body: unknown
+  constructor(message: string, status: number, body: unknown) { super(message); this.status = status; this.body = body }
+}
+
+export type PolicyValue = 'auto' | 'require_review' | 'forbid'
+export interface PackStage { id:string;label:string;description:string;model:string;status:'live'|'coming_soon' }
+export interface PackTool { name: string; label: string; risk: string; default: PolicyValue; settings: PolicyValue[] }
+export interface PackBlock { id: string; label: string; status: 'live' | 'coming_soon' }
+export interface PackLane { id: string; label: string; description: string; status: 'live' | 'coming_soon'; blocks: PackBlock[]; tools?: PackTool[] }
+export interface Pack { id: string; label: string; description: string; agent_name: string; lanes: PackLane[]; stages:PackStage[];default_model:string;catalog:{label:string;status:string;description:string} }
+export interface VoiceConfig { agent_name: string; tone: string; custom_instructions: string }
+export interface PlaybookConfig { schema:number;pack:string;models?:{per_stage?:Record<string,{override?:string}>};voice:VoiceConfig;policy:Record<string,Record<string,PolicyValue>> }
+export interface Playbook { id:string;org_id:string;name:string;agent:string;case_type:string;config:PlaybookConfig;version:number;created_at:string }
+export interface EffectiveTool {value:PolicyValue;source:string;locked:boolean}
+export interface EffectiveConfig { config:PlaybookConfig;policy:Record<string,Record<string,EffectiveTool>>;model:string;models:Record<string,string> }
+export interface ProfileFact {id:string;label:string;text:string}
+export interface OrgProfile {business_name:string;hours:string;service_area:string;facts:ProfileFact[]}
+export interface ChannelConnection {id:string;org_id:string;kind:string;address:string;status:string;default_playbook_id:string;version:number;created_at:string}
+export interface ChannelKind {id:string;label:string;status:'available'|'coming_soon';description:string}
+
+export function getPacks(){return request<{packs:Pack[]}>('/api/packs')}
+export function listPlaybooks(){return request<{playbooks:Playbook[]}>('/api/playbooks')}
+export function getPlaybook(id:string){return request<{playbook:Playbook;effective:EffectiveConfig}>(`/api/playbooks/${id}`)}
+export function updatePlaybookConfig(playbook:Playbook,config:PlaybookConfig){return request<{playbook:Playbook;effective:EffectiveConfig}>(`/api/playbooks/${playbook.id}`,{method:'PATCH',body:JSON.stringify({command_id:crypto.randomUUID(),expected_version:playbook.version,config})})}
+export function getOrgProfile(){return request<{profile:OrgProfile;version:number}>('/api/org/profile')}
+export function updateOrgProfile(profile:OrgProfile,expectedVersion:number){return request<{profile:OrgProfile;version:number}>('/api/org/profile',{method:'PATCH',body:JSON.stringify({command_id:crypto.randomUUID(),expected_version:expectedVersion,profile})})}
+export function listChannels(){return request<{connections:ChannelConnection[];kinds:ChannelKind[]}>('/api/channels')}
+export function createChannel(input:{kind:string;address:string;defaultPlaybookId:string}){const commandId=crypto.randomUUID();return request<ChannelConnection>('/api/channels',{method:'POST',body:JSON.stringify({command_id:commandId,kind:input.kind,address:input.address,default_playbook_id:input.defaultPlaybookId})})}
+export function updateChannel(connection:ChannelConnection,defaultPlaybookId:string){return request<ChannelConnection>(`/api/channels/${connection.id}`,{method:'PATCH',body:JSON.stringify({command_id:crypto.randomUUID(),expected_version:connection.version,default_playbook_id:defaultPlaybookId})})}
 
 export function listConversations() {
   return request<{ conversations: ConversationSummary[] }>('/api/conversations')

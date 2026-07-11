@@ -1,8 +1,10 @@
 import { useState, type ReactNode } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { useParams } from '@tanstack/react-router'
+import { Link, useParams } from '@tanstack/react-router'
 import {
   BotIcon,
+  ArrowLeftIcon,
+  BriefcaseBusinessIcon,
   CheckIcon,
   ChevronRightIcon,
   InfoIcon,
@@ -10,6 +12,8 @@ import {
   ShieldCheckIcon,
   TriangleAlertIcon,
   UserIcon,
+  PanelRightCloseIcon,
+  PanelRightOpenIcon,
   ZapIcon,
 } from 'lucide-react'
 import {
@@ -36,7 +40,7 @@ import { JobPanel } from '../components/JobPanel'
 import { TimeAgo } from '../components/TimeAgo'
 import { Badge } from '@/components/ui/badge'
 import { Bubble, BubbleContent } from '@/components/ui/bubble'
-import { Button } from '@/components/ui/button'
+import { Button, buttonVariants } from '@/components/ui/button'
 import {
   Message as MessageRow,
   MessageContent,
@@ -57,6 +61,7 @@ import {
 } from '@/components/ui/collapsible'
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover'
 import { Skeleton } from '@/components/ui/skeleton'
+import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { cn } from '@/lib/utils'
 
 type TimelineItem =
@@ -201,7 +206,9 @@ function DetailsPopover({ data }: { data: ConversationDetail }) {
 }
 
 export function ConversationPage() {
-  const { conversationId } = useParams({ from: '/conversations/$conversationId' })
+  const { conversationId = '' } = useParams({ strict: false })
+  const [caseOpen,setCaseOpen]=useState(false)
+  const [casePinned,setCasePinned]=useState(()=>localStorage.getItem('dispatch.case-panel-pinned')==='true')
   const { data, isLoading, error } = useQuery({
     queryKey: ['conversation', conversationId],
     queryFn: () => getConversation(conversationId),
@@ -226,25 +233,17 @@ export function ConversationPage() {
   const timeline = buildTimeline(data.messages ?? [], data.actions ?? [])
   const sentActions = matchSentActions(data.messages ?? [], data.actions ?? [])
   const closed = data.conversation.status === 'closed'
+  const sourceMessageIds=(data.messages ?? []).filter(m=>m.direction==='inbound').slice(-5).map(m=>m.id)
+  const setPinned=(pinned:boolean)=>{setCasePinned(pinned);localStorage.setItem('dispatch.case-panel-pinned',String(pinned));if(pinned)setCaseOpen(false)}
+  const jobPanel=<JobPanel record={data.case} candidates={data.candidate_cases ?? []} conversationId={data.conversation.id} sourceMessageIds={sourceMessageIds} customerName={data.customer?.name} contact={data.contact} run={data.run} stage={data.current_stage} lastModel={data.last_model}/>
 
   return (
     <div className="flex h-full min-h-0">
       <div className="flex min-w-0 flex-1 flex-col">
-        <div className="flex items-center gap-3 border-b bg-card px-4 py-2">
-          <span className="text-sm font-semibold">
-            {data.customer?.name || data.contact || 'Unknown customer'}
-          </span>
-          <span className="font-mono text-[11px] text-muted-foreground">
-            {data.contact}
-          </span>
-          {closed && (
-            <Badge variant="outline" className="font-mono text-muted-foreground uppercase">
-              closed
-            </Badge>
-          )}
-          <div className="ml-auto flex items-center gap-1.5">
-            <DetailsPopover data={data} />
-          </div>
+        <div className="flex min-h-14 items-center gap-3 border-b bg-card px-3 py-2 sm:px-4">
+          <Link to="/inbox" search={{filter:'all'}} aria-label="Back to Inbox" className={cn(buttonVariants({variant:'ghost',size:'icon-sm'}),'md:hidden')}><ArrowLeftIcon/><span className="sr-only">Back to Inbox</span></Link>
+          <div className="min-w-0"><div className="flex items-baseline gap-2"><span className="truncate text-sm font-semibold">{data.customer?.name || data.contact || 'Unknown customer'}</span><span className="hidden shrink-0 font-mono text-[11px] text-muted-foreground sm:inline">{data.contact}</span></div><div className="mt-1 flex flex-wrap items-center gap-1.5">{data.current_stage&&<Badge variant="secondary">{data.current_stage.replace('_',' ')}</Badge>}{data.last_model&&<Badge variant="outline" className="hidden sm:inline-flex">{data.last_model}</Badge>}{data.current_draft&&<Badge variant="signal" className="pulse-soft">Awaiting decision</Badge>}{closed&&<Badge variant="outline" className="font-mono text-muted-foreground uppercase">closed</Badge>}</div></div>
+          <div className="ml-auto flex shrink-0 items-center gap-1.5"><DetailsPopover data={data}/><Button variant="outline" size="sm" onClick={()=>setCaseOpen(true)} className={cn(casePinned&&'xl:hidden')}><BriefcaseBusinessIcon data-icon="inline-start"/><span className="hidden sm:inline">Customer &amp; cases</span></Button><Button variant="ghost" size="icon-sm" className="hidden xl:inline-flex" aria-label={casePinned?'Unpin customer and cases':'Pin customer and cases'} onClick={()=>setPinned(!casePinned)}>{casePinned?<PanelRightCloseIcon/>:<PanelRightOpenIcon/>}</Button></div>
         </div>
 
         <EscalationBanner conv={data.conversation} />
@@ -296,17 +295,8 @@ export function ConversationPage() {
         </div>
       </div>
 
-      <aside className="w-80 shrink-0 overflow-y-auto border-l p-3">
-        <JobPanel
-          record={data.case}
-		  candidates={data.candidate_cases ?? []}
-		  conversationId={data.conversation.id}
-		  sourceMessageIds={(data.messages ?? []).filter(m=>m.direction==='inbound').slice(-5).map(m=>m.id)}
-          customerName={data.customer?.name}
-          contact={data.contact}
-          run={data.run}
-        />
-      </aside>
+      {casePinned&&<aside className="hidden w-80 shrink-0 overflow-y-auto border-l p-3 xl:block">{jobPanel}</aside>}
+      <Sheet open={caseOpen} onOpenChange={setCaseOpen}><SheetContent className="overflow-y-auto sm:max-w-md"><SheetHeader><SheetTitle>Customer &amp; cases</SheetTitle><SheetDescription>Customer context, the active case for this task, and customer-wide case history.</SheetDescription></SheetHeader><div className="px-4 pb-4">{jobPanel}</div></SheetContent></Sheet>
     </div>
   )
 }

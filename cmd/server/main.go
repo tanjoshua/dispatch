@@ -16,6 +16,7 @@ import (
 	"dispatch/app/channel"
 	"dispatch/app/channel/dev"
 	"dispatch/app/domain"
+	"dispatch/app/packs"
 	"dispatch/app/server"
 )
 
@@ -54,6 +55,7 @@ func main() {
 		Sender:        sender,
 		DefaultOrgID:  app.OrgID,
 		ActorProvider: server.StaticActorProvider(env("DISPATCH_DEV_ACTOR", "dispatcher:dev")),
+		Packs:         packs.Default(),
 	}
 
 	log.Printf("api server listening on :%s", port)

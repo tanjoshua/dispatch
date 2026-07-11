@@ -95,10 +95,22 @@ Key cardinality decisions (these replaced the v1 1:1 chain):
   and channels. Replies route through that same identity.
 - **Run ≠ conversation.** Runs come and go per task; a thread has many, at
   most one awaiting customer input. `run_bindings` keeps agentkit's `runs`
-  table business-agnostic.
-- **Playbook is the horizontal seam.** Connection → playbook → agent + case
-  type. One pack exists (field service: `{address, issue, urgency}`); the
-  pack SDK (config-driven schemas/prompts/policy) waits for a second vertical.
+  table business-agnostic. Its forward-only `stage` projection starts at
+  triage, advances to inquiry after a case-less response, and advances to
+  service job when a case is selected. The activity resolver reads it on each
+  turn, so pack-owned stage models apply without workflow state or imports.
+- **Playbook is the horizontal seam.** Connection → playbook → pack + case
+  type. The field-service pack owns fixed lanes, tools, policy floors,
+  per-stage models, and its prompt template. `playbooks.config` is a
+  schema-versioned envelope (`pack`, voice, per-lane policy); models are
+  vendor-owned, with a hidden per-stage override reserved for operations. It
+  parameterizes those capabilities but cannot reorder them into a workflow.
+- **Knowledge is organization-level.** `organizations.settings.profile`
+  carries business name, hours, service area, and labeled facts. The pack
+  prompt renders these as the only operational facts the agent may state.
+  Organization, playbook, and channel-connection settings use versioned CAS
+  writes. Every accepted command is snapshotted in append-only
+  `config_revisions` with command ID and actor attribution.
 
 ## 4. The agent loop
 
@@ -179,7 +191,7 @@ for run is open:
   UI renders one current response draft, case candidates, case corrections,
   conflict-safe decisions/replies, and blocked delivery states.
 
-The migration also creates the durable seams for the remaining coordinator
+Migration 0011 also creates the durable seams for the remaining coordinator
 cutover: `outbox`, `context_snapshots`, and `model_turns`. The active Temporal
 workflow is still the legacy run-scoped loop; replacing it with
 `ConversationCoordinatorV2`, processing outbox rows independently of the HTTP
@@ -187,11 +199,12 @@ process, persisting per-turn snapshots/model requests, and performing
 delivery-dependent run completion remain the next implementation slice.
 
 - **Infra:** docker-compose (Postgres 16 + Temporal dev server), `cmd/migrate`
-  (11 migrations), `cmd/server` (JSON API :8080), `cmd/worker`. ULIDs
+  (12 migrations), `cmd/server` (JSON API :8080), `cmd/worker`. ULIDs
   everywhere; `org_id` on every table (seeded `org_dev`, `chan_dev`,
   `pb_field_service`).
 - **agentkit:** full Action state machine with idempotent Postgres store;
-  StaticPolicy (per-tool, RequireApproval default); append-only event log incl.
+  an activity-time `AgentResolver` seam (plus a static adapter for tests),
+  Policy interface with RequireApproval default; append-only event log incl.
   per-completion `llm_completed` usage events (billing/eval substrate); JSON
   Schema validation of effective input at the ExecuteAction choke point;
   per-turn LLM budget (`MaxLLMCallsPerTurn`, exceed → event + app hook); run
@@ -199,7 +212,14 @@ delivery-dependent run completion remain the next implementation slice.
   provider-agnostic LLM interface + Anthropic adapter (default
   `claude-opus-4-8`; unmodeled schema keywords pass through); temporalkit
   agent loop as above.
-- **Intake agent (the one pack):** case resolution is explicit through
+- **Field-service pack:** a code-owned registry describes inquiry,
+  service-job, and locked quote lanes; live/coming-soon blocks; curated model
+  tiers; tool risk text, defaults, settings, and floors. Pure pack functions
+  validate writes and compute the same effective configuration used at
+  runtime and in the API. The app resolver reads the run's playbook and org
+  profile on each activity, then assembles model, rendered prompt, tools, and
+  a lane-aware `ConfigPolicy`. Malformed persisted sections degrade to pack
+  defaults instead of bricking the loop. Case resolution is explicit through
   `list_candidate_cases`, `select_case`, and `create_case`; `update_case`
   compare-and-sets the selected case with exact source-message provenance.
   `propose_response` is the single reviewed customer-facing unit and may carry
@@ -207,7 +227,8 @@ delivery-dependent run completion remain the next implementation slice.
   `wait_for_external` stop or pause work without pretending a customer message
   or external notification was sent. A fresh run receives customer, rolling
   summary, candidate-case, and recent-message context through `SystemContext`.
-  `DISPATCH_FAKE_LLM=1` provides a scripted LLM for keyless demos/e2e.
+  `DISPATCH_FAKE_LLM=1` provides a scripted LLM for keyless demos/e2e,
+  including a no-case hours inquiry whose delivered response completes its run.
 - **Channels:** kind = code (`Adapter`), connection = data. Shared `Sender`
   persists delivery state and uses the action/message ID as its idempotency
   key. `Router` resolves an exact identity and transactionally inserts the
@@ -217,11 +238,20 @@ delivery-dependent run completion remain the next implementation slice.
 - **API:** `POST /api/dev/inbound`, `GET /api/conversations[/{id}]`,
   `POST /api/actions/{id}/decision`, `POST /api/conversations/{id}/reply`,
   `POST /api/conversations/{id}/acknowledge`, `GET /api/runs/{id}/events`,
-  `GET /api/stats/decisions` (per-tool outcome rates + human-decision latency).
-- **Web UI:** conversation list with pending badges (with oldest-pending age)
-  + escalation flags, queue-wide worst wait in the header, message thread with
+  `GET /api/stats/decisions` (per-tool outcome rates + human-decision latency),
+  plus pack/playbook, organization-profile, and channel settings endpoints.
+  Settings writes are org-scoped, actor-attributed, command-idempotent CAS
+  operations; policy-floor violations return field-level 422 errors.
+- **Web UI:** one app-wide sidebar promotes Inbox, Playbooks, Knowledge,
+  Channels, and Insights. Inbox filters pending decisions and escalations,
+  shows queue-wide pending count/worst wait, and opens the message thread with
   agent-draft review (approve / edit / revise / dismiss), case panel, customer
-  simulator pane, `/stats` decision-metrics page. Polling (1.5–5s).
+  simulator sheet and `/insights` decision metrics. Playbooks expose
+  playbook lanes, approval policy with inline evidence, read-only actual
+  models per journey stage, and voice controls,
+  an honestly locked service catalog, channel routing/dev connections, and
+  organization knowledge. Conversation surfaces poll (1.5–5s); settings fetch
+  on mount and invalidate only after mutation.
 - **Verified live** (scripted LLM + real Temporal/Postgres): full
   propose→decide→execute loop incl. edits and rejection-revision; worker
   restart mid-run resumes with pending action intact; persistent threads with
@@ -277,6 +307,9 @@ The remaining work is grouped by the boundary it completes.
 7. **Identity merge and verified profile editing are incomplete.** Exact
    routing is safe, and dispatchers can correct case data, but customer-level
    identity merge/dedup and audited profile correction remain product work.
+8. **Dedicated review-queue surface is deferred.** Inbox provides
+   Needs-decision, Escalated, and All filters, but bulk review and assignment
+   need a purpose-built queue once operating volume justifies it.
 
 ### 6.4 Designed but not built
 
@@ -284,21 +317,23 @@ The remaining work is grouped by the boundary it completes.
   dispatcher-approved response-completion summary line (cheap, human-reviewed); an
   LLM-generated summary can replace it behind the same
   `conversations.thread_summary` column when threads outgrow five lines.
-- **Pack SDK + second vertical** (was the future design 006): playbook
-  `config` driving `update_case` schema, prompts, policy parameters; a
-  registered tool catalog packs select from. Deliberately waits until a
-  second vertical presses on the shape.
+- **Pack SDK + second vertical** (was the future design 006): the delivered
+  registry now owns lanes, prompt rendering, per-stage models, policy parameters,
+  floors, and an honest catalog placeholder. Still missing are a registered
+  case-schema/tool catalog that drives `update_case`, service-catalog wiring,
+  and the pressure-test of a genuinely different second vertical.
 - **Post-intake runs** (scheduling, follow-up): new task kinds + case
   lifecycle states on the same Action/Policy machinery — new agents, not new
   architecture. Unblocked by run-per-task and triage.
-- **Auto-approval policy design** (risk levels on tools, per-org policy
-  config, confidence): the v2 slider turn. Its evidence now exists
-  (`/api/stats/decisions`); design when a few weeks of real decisions
-  accumulate.
+- **Auto-approval policy design:** per-org, per-lane Auto/Review/Forbid is now
+  live and clamped by code-owned floors, with org-wide per-tool evidence
+  inline. Follow-ups are lane-split decision stats and confidence/evaluation
+  signals that can justify moving a floor rather than merely exposing a knob.
 - Smaller deferred items: unified customer-profile UI, identity merge/dedup,
   auth/authz, real WhatsApp adapter (Meta Cloud API / Twilio), attention
   moving from thread to case grain, decision timeouts (holding messages),
-  per-agent turn budgets on `AgentDefinition`.
+  per-agent turn budgets on `AgentDefinition`, config-revision history UI,
+  service-catalog-to-intake wiring.
 
 ### Suggested sequence
 

@@ -131,7 +131,7 @@ func newPipelineFixture(t *testing.T, script func(call int, req llm.CompletionRe
 	acts := &Activities{
 		LLM:    f.llm,
 		Store:  f.ms,
-		Agents: map[string]AgentDefinition{def.Name: def},
+		Agents: StaticAgents{def.Name: def},
 		TurnBudgetExceeded: func(_ context.Context, _, _ string) error {
 			*f.budget++
 			return nil

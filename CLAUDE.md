@@ -70,7 +70,7 @@ docs it consolidated live in git history.)
   tracked in `schema_migrations`.
 - `go run ./cmd/worker` — Temporal worker. Needs `ANTHROPIC_API_KEY`;
   `DISPATCH_FAKE_LLM=1` swaps in a scripted demo LLM (no API calls).
-  `DISPATCH_MODEL` overrides the model (default `claude-opus-4-8`).
+  The model is resolved per playbook from its tier or advanced raw-ID override.
 - `go run ./cmd/server` — JSON API on `:8080` (`PORT` to override).
 - `cd web && npm install && npm run dev` — dispatcher UI on `:5173`;
   Vite proxies `/api` to `:8080`.

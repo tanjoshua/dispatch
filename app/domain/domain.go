@@ -14,6 +14,7 @@ type Organization struct {
 	ID        string          `json:"id"`
 	Name      string          `json:"name"`
 	Settings  json.RawMessage `json:"settings,omitempty"` // open bag; typed fields graduate out as they earn it
+	Version   int64           `json:"version"`
 	CreatedAt time.Time       `json:"created_at"`
 }
 
@@ -30,6 +31,7 @@ type ChannelConnection struct {
 	Config            json.RawMessage `json:"config,omitempty"`
 	Status            string          `json:"status"`              // "active" | "disabled"
 	DefaultPlaybookID string          `json:"default_playbook_id"` // the playbook inbound on this connection routes to (design/004 §8)
+	Version           int64           `json:"version"`
 	CreatedAt         time.Time       `json:"created_at"`
 }
 

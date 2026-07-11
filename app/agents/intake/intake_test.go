@@ -9,13 +9,16 @@ import (
 	"dispatch/agentkit"
 	"dispatch/agentkit/llm"
 	"dispatch/agentkit/temporalkit"
+	"dispatch/app/packs"
 )
 
 // TestIntakePolicyRouting pins the v1 approval policy: internal, reversible
 // record-keeping auto-approves; anything customer-facing or terminal needs a
 // human, and unknown tools fall back to the safe default.
 func TestIntakePolicyRouting(t *testing.T) {
-	policy := Definition("test-model", nil, nil, nil).Policy
+	p := packs.Default()["field-service"]
+	effective := packs.EffectiveConfig(p, nil)
+	policy := packs.ConfigPolicy{Pack: p, Effective: effective}
 	cases := map[string]agentkit.PolicyDecision{
 		"list_candidate_cases": agentkit.AutoApprove,
 		"select_case":          agentkit.AutoApprove,

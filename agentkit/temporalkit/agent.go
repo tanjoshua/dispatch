@@ -5,12 +5,33 @@
 package temporalkit
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"sort"
 
 	"dispatch/agentkit"
 	"dispatch/agentkit/llm"
 )
+
+// AgentResolver resolves an agent definition for one activity invocation.
+// Applications can therefore apply tenant/run configuration without putting
+// database access in deterministic workflow code.
+type AgentResolver interface {
+	Resolve(ctx context.Context, orgID, runID, name string) (AgentDefinition, error)
+}
+
+// StaticAgents adapts a definition map for applications and tests whose agent
+// configuration is process-wide.
+type StaticAgents map[string]AgentDefinition
+
+func (a StaticAgents) Resolve(_ context.Context, _, _, name string) (AgentDefinition, error) {
+	def, ok := a[name]
+	if !ok {
+		return AgentDefinition{}, fmt.Errorf("temporalkit: unknown agent %q", name)
+	}
+	return def, nil
+}
 
 // Signal names. Signals carry IDs and small payloads, never blobs.
 const (
@@ -34,6 +55,8 @@ type AgentDefinition struct {
 	MaxTokens int
 	Tools     agentkit.ToolSet
 	Policy    agentkit.Policy
+	// Tags are application-supplied, business-agnostic usage dimensions.
+	Tags      map[string]string
 	// TerminalTools names tools whose successful execution completes the
 	// run (e.g. an intake agent's close_case).
 	TerminalTools []string
